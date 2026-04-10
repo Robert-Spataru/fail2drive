@@ -6,7 +6,7 @@ Fail2Drive is the first CARLA v2 benchmark designed to test closed-loop generali
 <p align="center">
   <h3 align="center">
     <a href="https://simonger.github.io/fail2drive/">Project Page</a> | 
-    <a href="https://arxiv.org/abs/2604.????">Paper</a> | 
+    <a href="https://arxiv.org/pdf/2604.08535">Paper</a> | 
     <a href="https://huggingface.co/datasets/SimonGer/Fail2Drive">Download</a>
   </h3>
 </p>

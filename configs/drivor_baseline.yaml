@@ -1,0 +1,10 @@
+# DRIVOR baseline config
+name: drivor_baseline
+system: drivor
+mode: baseline
+camera_count: 2
+parameters:
+  fps: 30
+  resolution: [1920, 1080]
+  safety_margin: 1.0
+  note: "Baseline settings for DRIVOR. Update as needed."

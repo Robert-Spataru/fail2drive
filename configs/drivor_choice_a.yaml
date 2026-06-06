@@ -1,0 +1,11 @@
+# DRIVOR choice A config
+name: drivor_choice_a
+system: drivor
+mode: choice
+variant: A
+camera_count: 3
+parameters:
+  fps: 30
+  resolution: [1280, 720]
+  strategy: "choice_a"
+  note: "Placeholder for DRIVOR choice A configuration."

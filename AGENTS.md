@@ -12,8 +12,7 @@ python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
   --agent [YOUR_AGENT_FILE] \
   --agent-config [YOUR_AGENT_CONFIG]
 E.x:
-python leaderboard/leaderboard/leaderboard_evaluator_local.py \
-  --routes ${WORK_DIR}/fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
-  --agent ${WORK_DIR}/team_code/agent_code.py \
-  --agent-config ${WORK_DIR}/checkpoints/tfpp
-
+python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
+  --routes $F2D_DIR/fail2drive_split/Generalization_PedestriansOnRoad_185.xml \
+  --agent /data/robert/fail2drive/team_code/autoagent0_agent.py \
+  --agent-config /data/robert/fail2drive/configs/rule_based.yaml

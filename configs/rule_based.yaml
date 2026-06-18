@@ -1,39 +1,12 @@
 rule_based:
   repo_root: /data/robert/Rule-Planner
-  python_bin: /data/miniconda3/envs/fail2drive/bin/python 
+  python_bin: /data/robert/fail2drive/env/bin/python
   config: /data/robert/Rule-Planner/config_example.yaml
   device: cpu
-
+  
   vlm:
     enabled: false
-    intervention_enabled: false
-    camera_mode: front_only
-    scoring_camera_mode: front_only
-    backend: local_transformers_subprocess
-    model_id: Qwen/Qwen3-VL-8B-Instruct
-    output_model_slug: qwen3-vl-8b-instruct
-    device: auto
-    python_bin: /data/miniconda3/envs/fail2drive/bin/python   
-    max_new_tokens: 300
-    candidate_limit: 10
-    timeout_sec: 180.0
-    save_debug_artifacts: true
-    debug_dir_name: vlm_debug
-    carry_previous_enabled: true
-    carry_previous_min_path_m: 0.5
-    carry_previous_min_points: 2
-    adaptive_replan_mode: log_only
-    latency_tracking_mode: full_timeline
-    q_enabled: true
-    q_switch_margin: 0.05
-    q_weight_rap_score: 0.55
-    q_weight_progress: 0.30
-    q_weight_offcenter: 0.10
-    q_weight_curvature: 0.08
-    q_weight_shortplan: 0.18
-    q_carry_score_decay: 0.0
-    display_default_trajectories: false
-    include_default_candidates: false
+
 
 carla:
   output_dir: /data/robert/outputs/fail2drive/rule_based
@@ -44,3 +17,17 @@ carla:
   camera_y: 0.0
   camera_z: 1.6
   attach_camera: false
+
+  # Preset rigs: front_only | rap_4cam | full_6cam
+  # Or override with an explicit list, e.g. cameras: [CAM_FRONT, CAM_FRONT_LEFT]
+  camera_rig: front_only
+
+  recording:
+    enabled: true
+    dir_name: recordings
+    save_frames: true
+    save_video: true
+    save_front_video: true
+    save_grid_video: true
+    fps: 20
+    frame_format: jpg

@@ -1,0 +1,27 @@
+# DrivoR baseline for Fail2Drive/CARLA (argmax, no VLM)
+drivor:
+  repo_root: /data/robert/DrivoR
+  checkpoint: /data/robert/DrivoR/weights/checkpoints/drivor_Nav1_25epochs.pth
+  dino: /data/robert/DrivoR/weights/vit_small_patch14_reg4_dinov2.lvd142m
+  config: /data/robert/DrivoR/navsim/planning/script/config/common/agent/drivoR.yaml
+  python_bin: /data/robert/fail2drive/env/bin/python
+  device: cuda
+
+  vlm:
+    enabled: false
+
+  rule_based_merge:
+    enabled: false
+
+carla:
+  output_dir: /data/robert/outputs/fail2drive/drivor
+  camera_rig: rap_4cam
+  recording:
+    enabled: true
+    dir_name: recordings
+    save_frames: true
+    save_video: true
+    save_front_video: true
+    save_grid_video: true
+    fps: 20
+    frame_format: jpg

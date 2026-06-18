@@ -1,0 +1,8 @@
+# Shortest overall (with scenario)
+--routes $WORK_DIR/fail2drive_split/Generalization_ImageOnObject_1044.xml
+
+# Shortest drive-only smoke test
+--routes $WORK_DIR/fail2drive_split/Base_PedestrianCrowd_0068.xml
+
+# Shortest PedestriansOnRoad (your current scenario type)
+--routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1088.xml

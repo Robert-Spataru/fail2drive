@@ -1,0 +1,25 @@
+# Terminal 1: CARLA server
+bash /data2/autoagent0/f2d_carla/CarlaUE4.sh -RenderOffScreen
+
+
+# Terminal 2: CARLA client
+cd /data/robert/fail2drive
+conda activate ./env
+source env_vars.sh && conda activate ./env
+
+python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
+  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
+  --agent $WORK_DIR/team_code/autoagent0_agent.py \
+  --agent-config $WORK_DIR/configs/rule_based.yaml
+  
+# RAP baseline (requires navsim RAP repo + checkpoint paths in configs/rap.yaml)
+python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
+  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1088.xml \
+  --agent $WORK_DIR/team_code/autoagent0_agent.py \
+  --agent-config $WORK_DIR/configs/rap.yaml
+
+# DrivoR baseline
+python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
+  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1088.xml \
+  --agent $WORK_DIR/team_code/autoagent0_agent.py \
+  --agent-config $WORK_DIR/configs/drivor.yaml

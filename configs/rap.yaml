@@ -1,0 +1,35 @@
+# RAP baseline for Fail2Drive/CARLA (argmax, no VLM)
+rap:
+  repo_root: /data/robert/RAP_navsim
+  checkpoint: /data/robert/models/RAP_DINO_navsimv2.ckpt
+  python_bin: /data/robert/fail2drive/env/bin/python
+  device: cuda
+  image_scale: 0.4
+  use_scene_rig_lidar2img: true
+  nuplan_devkit_dir: /data/robert/DrivoR/nuplan-devkit
+
+  # Pre-downloaded Hugging Face cache for DINOv3 backbone
+  hf_home: /data/robert/models/hf
+  hf_hub_cache: /data/robert/models/hf/hub
+  transformers_cache: /data/robert/models/hf/hub
+  hf_hub_offline: false
+  transformers_offline: false
+
+  vlm:
+    enabled: false
+
+  rule_based_merge:
+    enabled: false
+
+carla:
+  output_dir: /data/robert/outputs/fail2drive/rap
+  camera_rig: rap_4cam
+  recording:
+    enabled: true
+    dir_name: recordings
+    save_frames: true
+    save_video: true
+    save_front_video: true
+    save_grid_video: true
+    fps: 20
+    frame_format: jpg

@@ -8,18 +8,18 @@ conda activate ./env
 source env_vars.sh && conda activate ./env
 
 python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
-  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
+  --routes $WORK_DIR/fail2drive_split/Generalization_ImageOnObject_1044.xml \
   --agent $WORK_DIR/team_code/autoagent0_agent.py \
   --agent-config $WORK_DIR/configs/rule_based.yaml
   
 # RAP baseline (requires navsim RAP repo + checkpoint paths in configs/rap.yaml)
 python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
-  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1088.xml \
+  --routes $WORK_DIR/fail2drive_split/Generalization_ImageOnObject_1044.xml \
   --agent $WORK_DIR/team_code/autoagent0_agent.py \
   --agent-config $WORK_DIR/configs/rap.yaml
 
 # DrivoR baseline
 python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
-  --routes $WORK_DIR/fail2drive_split/Generalization_PedestriansOnRoad_1088.xml \
+  --routes $WORK_DIR/fail2drive_split/Generalization_ImageOnObject_1044.xml \
   --agent $WORK_DIR/team_code/autoagent0_agent.py \
   --agent-config $WORK_DIR/configs/drivor.yaml

@@ -13,9 +13,9 @@ if str(_F2D_ROOT) not in sys.path:
     sys.path.insert(0, str(_F2D_ROOT))
 
 # Add HUGSIM root for anything not copied over
-_HUGSIM_ROOT = Path("/data/robert/HUGSIM")
-if str(_HUGSIM_ROOT) not in sys.path:
-    sys.path.insert(0, str(_HUGSIM_ROOT))
+_AUTOAGENT0_ROOT = Path("/data/robert/AutoAgent0")
+if str(_AUTOAGENT0_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AUTOAGENT0_ROOT))
 
 from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
@@ -27,6 +27,7 @@ from autoagent0_carla_helper import (
     find_hero,
     get_ego_state,
     maybe_record_frames,
+    record_post_step_visualization,
     run_step_drivor,
     run_step_rap,
     run_step_rule_based,
@@ -83,6 +84,10 @@ class AutoAgent0CarlaAgent(AutonomousAgent):
             setup_rap(self)
         elif self._planner_type == "drivor":
             setup_drivor(self)
+        else:
+            raise ValueError(
+                f"Invalid planner type: {self._planner_type}"
+            )
 
         setup_cameras_and_recording(self)
 
@@ -139,6 +144,7 @@ class AutoAgent0CarlaAgent(AutonomousAgent):
         else:
             ctrl = brake_control()
 
+        record_post_step_visualization(self, ego_state)
         self._frame_index += 1
         return ctrl
 

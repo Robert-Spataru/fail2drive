@@ -15,13 +15,21 @@ drivor:
 
 carla:
   output_dir: /data/robert/outputs/fail2drive/drivor
-  camera_rig: rap_4cam
+  auto_run_id: true
+  camera_rig: 4cam
+  predictions_dir: predictions
+  topdown_camera:
+    width: 800
+    height: 800
+    z: 45.0
+    fov: 90.0
+    pitch: -90.0
   recording:
     enabled: true
     dir_name: recordings
-    save_frames: true
-    save_video: true
-    save_front_video: true
+    save_frames: false
+    save_video: false
+    save_front_video: false
     save_grid_video: true
+    save_topdown_video: true
     fps: 20
-    frame_format: jpg

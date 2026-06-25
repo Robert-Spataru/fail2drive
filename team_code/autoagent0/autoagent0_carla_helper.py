@@ -6,8 +6,11 @@ import logging
 import math
 import os
 import sys
+import json
+import re
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import carla
 import cv2
@@ -18,7 +21,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 LOG = logging.getLogger(__name__)
 
 _F2D_ROOT = Path(__file__).parent.parent.parent
-_HUGSIM_ROOT = Path("/data/robert/HUGSIM")
+_AUTOAGENT0_ROOT = Path("/data/robert/AutoAgent0")
 
 EGO_HISTORY_FRAMES = 4
 RULE_BASED_TOPK = 10
@@ -36,19 +39,310 @@ CAMERA_MOUNTS: Dict[str, Dict[str, float]] = {
 
 CAMERA_RIGS: Dict[str, List[str]] = {
     "front_only": ["CAM_FRONT"],
-    "rap_4cam": [
+    "4cam": [
         "CAM_BACK",
         "CAM_FRONT",
         "CAM_FRONT_LEFT",
         "CAM_FRONT_RIGHT",
     ],
     "full_6cam": list(CAMERA_MOUNTS.keys()),
+    "rap_4cam": [
+        "CAM_BACK",
+        "CAM_FRONT",
+        "CAM_FRONT_LEFT",
+        "CAM_FRONT_RIGHT",
+    ],
 }
 
 VIDEO_GRID_LAYOUT = [
     ["CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT"],
     ["CAM_BACK_RIGHT", "CAM_BACK", "CAM_BACK_LEFT"],
 ]
+
+TOPDOWN_CAMERA_ID = "CAM_TOPDOWN"
+TOPDOWN_VIZ_TOPK = 5
+TOPDOWN_SELECTED_COLOR_BGR = (80, 255, 80)
+TOPDOWN_CANDIDATE_COLOR_BGR = (200, 200, 200)
+TOPDOWN_EGO_COLOR_BGR = (255, 255, 255)
+
+
+def navsim_proposal_to_hugsim_plan(trajectory: np.ndarray) -> np.ndarray:
+    traj = np.asarray(trajectory, dtype=np.float32)
+    if traj.ndim == 1:
+        traj = traj.reshape(1, -1)
+    right = -traj[:, 1]
+    forward = traj[:, 0]
+    return np.stack([right, forward], axis=-1).astype(np.float32)
+
+
+def build_step_viz_payload(
+    *,
+    selected_plan: np.ndarray,
+    selected_source: str,
+    selected_score: Optional[float],
+    proposals: np.ndarray,
+    scores: np.ndarray,
+    output_num_poses: int,
+    topk: int = TOPDOWN_VIZ_TOPK,
+    proposals_already_hugsim: bool = False,
+) -> Dict[str, Any]:
+    proposals = np.asarray(proposals, dtype=np.float32)
+    scores = np.asarray(scores, dtype=np.float32)
+    if proposals.ndim == 2:
+        proposals = proposals[np.newaxis, ...]
+        scores = scores.reshape(1)
+
+    topk = max(1, min(int(topk), int(len(scores))))
+    top_indices = np.argsort(scores)[-topk:][::-1]
+    candidate_plans: List[np.ndarray] = []
+    candidate_scores: List[float] = []
+    for idx in top_indices:
+        if proposals_already_hugsim:
+            plan = np.asarray(proposals[int(idx)], dtype=np.float32)
+        else:
+            plan = navsim_proposal_to_hugsim_plan(
+                proposals[int(idx), :output_num_poses]
+            )
+        candidate_plans.append(plan)
+        candidate_scores.append(float(scores[int(idx)]))
+
+    return {
+        "selected_plan": np.asarray(selected_plan, dtype=np.float32),
+        "selected_source": str(selected_source),
+        "selected_score": (
+            None if selected_score is None else float(selected_score)
+        ),
+        "candidate_plans": candidate_plans,
+        "candidate_scores": candidate_scores,
+    }
+
+
+def resolve_predictions_dir(agent) -> Optional[Path]:
+    raw = agent._carla_cfg.get("predictions_dir")
+    if not raw:
+        return None
+    path = Path(str(raw)).expanduser()
+    auto_run_id = coerce_bool(agent._carla_cfg.get("auto_run_id", True), default=True)
+    if auto_run_id:
+        rel = path.name if path.is_absolute() else str(path)
+        if rel in {".", ""}:
+            rel = "predictions"
+        return agent._output_dir / rel
+    if not path.is_absolute():
+        path = agent._output_dir / path
+    return path
+
+
+def build_topdown_camera_spec(carla_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    td_cfg = carla_cfg.get("topdown_camera") or {}
+    width = int(td_cfg.get("width", 800))
+    height = int(td_cfg.get("height", width))
+    return {
+        "id": TOPDOWN_CAMERA_ID,
+        "type": "sensor.camera.rgb",
+        "x": float(td_cfg.get("x", 0.0)),
+        "y": float(td_cfg.get("y", 0.0)),
+        "z": float(td_cfg.get("z", 45.0)),
+        "roll": float(td_cfg.get("roll", 0.0)),
+        "pitch": float(td_cfg.get("pitch", -90.0)),
+        "yaw": float(td_cfg.get("yaw", 0.0)),
+        "width": width,
+        "height": height,
+        "fov": float(td_cfg.get("fov", 90.0)),
+    }
+
+
+def topdown_pixels_per_meter(width: int, fov_deg: float, altitude_m: float) -> float:
+    ground_span_m = 2.0 * altitude_m * math.tan(math.radians(fov_deg * 0.5))
+    return float(width) / max(ground_span_m, 1e-3)
+
+
+def _plan_to_pixel_points(
+    plan: np.ndarray,
+    *,
+    center_xy: Tuple[int, int],
+    pixels_per_meter: float,
+) -> np.ndarray:
+    plan = np.asarray(plan, dtype=np.float32)
+    if len(plan) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    cx, cy = center_xy
+    xs = cx + plan[:, 0] * pixels_per_meter
+    ys = cy - plan[:, 1] * pixels_per_meter
+    return np.round(np.stack([xs, ys], axis=1)).astype(np.int32)
+
+
+def overlay_trajectories_on_topdown(
+    image_rgb: np.ndarray,
+    viz_payload: Dict[str, Any],
+    *,
+    pixels_per_meter: float,
+    ego_center_xy: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
+    img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    height, width = img.shape[:2]
+    center = ego_center_xy or (width // 2, height // 2)
+
+    for plan in viz_payload.get("candidate_plans", []):
+        pts = _plan_to_pixel_points(
+            plan, center_xy=center, pixels_per_meter=pixels_per_meter
+        )
+        if len(pts) < 2:
+            continue
+        cv2.polylines(
+            img,
+            [pts],
+            isClosed=False,
+            color=TOPDOWN_CANDIDATE_COLOR_BGR,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+
+    selected_plan = viz_payload.get("selected_plan")
+    if selected_plan is not None and len(selected_plan) > 0:
+        pts = _plan_to_pixel_points(
+            selected_plan,
+            center_xy=center,
+            pixels_per_meter=pixels_per_meter,
+        )
+        if len(pts) >= 2:
+            cv2.polylines(
+                img,
+                [pts],
+                isClosed=False,
+                color=TOPDOWN_SELECTED_COLOR_BGR,
+                thickness=3,
+                lineType=cv2.LINE_AA,
+            )
+
+    cv2.circle(
+        img, center, 6, TOPDOWN_EGO_COLOR_BGR, thickness=-1, lineType=cv2.LINE_AA
+    )
+
+    label = str(viz_payload.get("selected_source", ""))
+    score = viz_payload.get("selected_score")
+    if score is not None:
+        label = f"{label} ({float(score):.2f})"
+    if label:
+        cv2.putText(
+            img,
+            label,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            TOPDOWN_SELECTED_COLOR_BGR,
+            2,
+            cv2.LINE_AA,
+        )
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def save_predictions_frame(
+    agent,
+    frame_idx: int,
+    viz_payload: Dict[str, Any],
+    info: Dict[str, Any],
+) -> None:
+    predictions_dir = getattr(agent, "_predictions_dir", None)
+    if predictions_dir is None:
+        return
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "frame_index": int(frame_idx),
+        "timestamp": float(info.get("timestamp", 0.0)),
+        "selected_source": str(viz_payload.get("selected_source", "")),
+        "selected_score": viz_payload.get("selected_score"),
+        "selected_plan": np.asarray(
+            viz_payload.get("selected_plan", []), dtype=np.float32
+        ).tolist(),
+        "candidates": [
+            {
+                "score": float(score),
+                "plan": np.asarray(plan, dtype=np.float32).tolist(),
+            }
+            for plan, score in zip(
+                viz_payload.get("candidate_plans", []),
+                viz_payload.get("candidate_scores", []),
+            )
+        ],
+    }
+    out_path = predictions_dir / f"{frame_idx:05d}.json"
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def record_post_step_visualization(agent, ego_state: Dict[str, Any]) -> None:
+    viz_payload = getattr(agent, "_step_viz", None)
+    agent._step_viz = None
+    if viz_payload is None:
+        return
+
+    info = ego_state.get("info", {})
+    frame_idx = agent._frame_index
+    save_predictions_frame(agent, frame_idx, viz_payload, info)
+
+    if not getattr(agent, "_recording_save_topdown_video", False):
+        return
+
+    topdown_rgb = ego_state.get("topdown_rgb")
+    if topdown_rgb is None:
+        spec = getattr(agent, "_topdown_camera_spec", None) or {}
+        width = int(spec.get("width", 800))
+        height = int(spec.get("height", width))
+        topdown_rgb = np.full((height, width, 3), 32, dtype=np.uint8)
+
+    overlay = overlay_trajectories_on_topdown(
+        topdown_rgb,
+        viz_payload,
+        pixels_per_meter=float(
+            getattr(agent, "_topdown_pixels_per_meter", 10.0)
+        ),
+    )
+    agent._topdown_video_buffer.append(overlay)
+
+
+
+def _sanitize_run_id(run_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(run_id).strip())
+    return cleaned or "run"
+
+
+def resolve_run_output_dir(
+    carla_cfg: Dict[str, Any],
+    *,
+    base_output_dir: Path,
+    planner_type: str,
+    config_path: Optional[str] = None,
+) -> Path:
+    """Create a unique per-run output directory under base_output_dir/runs/."""
+    auto_run_id = coerce_bool(carla_cfg.get("auto_run_id", True), default=True)
+    if not auto_run_id:
+        base_output_dir.mkdir(parents=True, exist_ok=True)
+        return base_output_dir
+
+    run_id = carla_cfg.get("run_id")
+    if not run_id:
+        run_id = f"{planner_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id = _sanitize_run_id(str(run_id))
+
+    runs_parent = str(carla_cfg.get("run_dir_name", "runs")).strip() or "runs"
+    run_output_dir = base_output_dir / runs_parent / run_id
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "run_id": run_id,
+        "planner_type": planner_type,
+        "base_output_dir": str(base_output_dir),
+        "run_output_dir": str(run_output_dir),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "config_path": config_path,
+    }
+    manifest_path = run_output_dir / "run_info.json"
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    LOG.info("Run output directory: %s (run_id=%s)", run_output_dir, run_id)
+    return run_output_dir
 
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
@@ -114,7 +408,7 @@ def resolve_camera_specs(carla_cfg: Dict[str, Any], *, attach_legacy: bool, plan
         if planner_type in {"rap", "drivor"}:
             return [
                 _build_camera_spec(cam_id, carla_cfg)
-                for cam_id in CAMERA_RIGS["rap_4cam"]
+                for cam_id in CAMERA_RIGS["4cam"]
             ]
         return [_build_camera_spec("CAM_FRONT", carla_cfg)]
     return []
@@ -187,7 +481,7 @@ def get_plan2control():
         if key == "sim" or key.startswith("sim.")
     }
     try:
-        _sys.path = [str(_HUGSIM_ROOT)] + [
+        _sys.path = [str(_AUTOAGENT0_ROOT)] + [
             entry
             for entry in saved_path
             if entry not in ("", str(_F2D_ROOT))
@@ -221,7 +515,8 @@ def traj_to_control(plan_traj: np.ndarray, info: Dict[str, Any]):
 
 
 def build_vlm_selector_config_from_dict(vlm_dict: dict) -> "VLMSelectorConfig":
-    from planners.common.vlm_selector import VLMSelectorConfig
+    # importing from AutoAgent0 repo
+    from autoagent0.decision.vlm_selector import VLMSelectorConfig
     return VLMSelectorConfig(
         enabled=bool(vlm_dict.get("enabled", False)),
         intervention_enabled=bool(
@@ -369,7 +664,7 @@ def setup_rule_based(agent):
         "Rule-based output_num_poses=%d", agent._rule_based_output_num_poses
     )
 
-    from planners.rule_based import client as rb_client
+    from autoagent0.planners.rule_based import planner as rb_client
     from autoagent0.adapters.hugsim.geometry import info_to_pose
 
     agent._rb_client = rb_client
@@ -400,7 +695,7 @@ def setup_rule_based(agent):
         os.environ["PLANNER_VLM_PYTHON_BIN"] = os.environ[
             "RULE_BASED_VLM_PYTHON_BIN"
         ]
-        from planners.common.vlm_selector import VLMPlanSelector
+        from autoagent0.decision.vlm_selector import VLMPlanSelector
         agent._vlm_selector = VLMPlanSelector(
             agent._vlm_selector_cfg, agent._output_dir
         )
@@ -423,7 +718,7 @@ def apply_rule_based_merge_env(
     python_bin: str,
     prefixes: tuple[str, ...],
 ) -> None:
-    from planners.common.rule_based_env import build_prefixed_rule_based_env
+    from autoagent0.experts.rule_based_env import build_prefixed_rule_based_env
 
     env_values = build_prefixed_rule_based_env(
         rb_merge_dict or {},
@@ -433,13 +728,69 @@ def apply_rule_based_merge_env(
     for key, value in env_values.items():
         os.environ[str(key)] = str(value)
 
-def setup_vlm_selector(agent, vlm_dict: Optional[Dict[str, Any]]) -> None:
+def export_hf_env(
+    planner_cfg: Dict[str, Any],
+    *,
+    default_hf_home: str = "/data/robert/models/hf",
+) -> None:
+    """Set Hugging Face cache env vars for VLM / transformer model downloads."""
+    hf_home = Path(str(planner_cfg.get("hf_home", default_hf_home))).expanduser()
+    hf_hub_cache = Path(
+        str(planner_cfg.get("hf_hub_cache", hf_home / "hub"))
+    ).expanduser()
+    hf_home.mkdir(parents=True, exist_ok=True)
+    hf_hub_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_home)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_hub_cache)
+    os.environ["TRANSFORMERS_CACHE"] = str(
+        planner_cfg.get("transformers_cache", hf_hub_cache)
+    )
+    if planner_cfg.get("hf_hub_offline") is not None:
+        os.environ["HF_HUB_OFFLINE"] = (
+            "1" if coerce_bool(planner_cfg.get("hf_hub_offline"), default=True) else "0"
+        )
+    if planner_cfg.get("transformers_offline") is not None:
+        os.environ["TRANSFORMERS_OFFLINE"] = (
+            "1"
+            if coerce_bool(planner_cfg.get("transformers_offline"), default=True)
+            else "0"
+        )
+
+
+def resolve_vlm_subprocess_gpu_index(vlm_dict: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not vlm_dict:
+        return None
+    cuda_device = str(vlm_dict.get("cuda_device", "")).strip()
+    if cuda_device:
+        return cuda_device
+    device = str(vlm_dict.get("device", "")).strip()
+    if device.startswith("cuda:"):
+        return device.split(":", 1)[1]
+    return None
+
+
+def setup_vlm_selector(
+    agent,
+    vlm_dict: Optional[Dict[str, Any]],
+    *,
+    planner_cfg: Optional[Dict[str, Any]] = None,
+) -> None:
     agent._vlm_selector_cfg = build_vlm_selector_config_from_dict(
         vlm_dict or {}
     )
     if agent._vlm_selector_cfg.enabled:
-        from planners.common.vlm_selector import VLMPlanSelector
+        if planner_cfg is not None:
+            export_hf_env(planner_cfg)
+        if coerce_bool((vlm_dict or {}).get("force_cpu_offload", False), default=False):
+            os.environ["PLANNER_VLM_FORCE_CPU_OFFLOAD"] = "1"
+        else:
+            os.environ.pop("PLANNER_VLM_FORCE_CPU_OFFLOAD", None)
+        from autoagent0.vlm.backends import set_vlm_subprocess_cuda_visible_devices
+        from autoagent0.decision.vlm_selector import VLMPlanSelector
 
+        set_vlm_subprocess_cuda_visible_devices(
+            resolve_vlm_subprocess_gpu_index(vlm_dict)
+        )
         agent._vlm_selector = VLMPlanSelector(
             agent._vlm_selector_cfg, agent._output_dir
         )
@@ -525,7 +876,7 @@ def export_drivor_env(drivor_cfg: Dict[str, Any]) -> None:
 def resolve_rule_based_merge(
     planner_cfg: Dict[str, Any], prefixes: tuple[str, ...]
 ):
-    from planners.common.rule_based_provider import (
+    from autoagent0.experts.rule_based_provider import (
         resolve_rule_based_merge_config,
     )
 
@@ -536,136 +887,70 @@ def resolve_rule_based_merge(
         prefixes=prefixes,
     )
 
-def select_learned_plan(
+def create_learned_planner_selector(
     agent,
     *,
-    obs: Dict[str, Any],
-    info: Dict[str, Any],
-    scores: np.ndarray,
-    proposals: np.ndarray,
-    output_num_poses: int,
-    build_candidate_rows_fn,
-    adapter_cfg: Any,
     rule_based_merge_cfg: Any,
-    privileged_agents: Optional[List[Dict[str, Any]]],
-    learned_source_name: str,
+    current_source_name: str,
     learned_default_source: str,
+    plain_source: str,
     score_fallback_key: str,
     planner_log_name: str,
     strict_learned_argmax_lookup: bool,
     q_key_prefix: bool,
-    plain_result_fn,
-) -> tuple[np.ndarray, Optional[float], str]:
-    if not agent._vlm_selector_cfg.enabled:
-        plain_result = plain_result_fn(proposals, scores, output_num_poses)
-        return (
-            np.asarray(plain_result["selected_plan"], dtype=np.float32),
-            float(plain_result.get("selected_score_raw", plain_result["selected_score"])),
-            str(plain_result["selected_row"].get("source", learned_default_source)),
+) -> Any:
+    from autoagent0.agent.runtime import AutoAgent0Runtime
+    from autoagent0.config import resolve_autoagent0_config
+    from autoagent0.decision.planner_selection import LearnedPlannerSelector
+
+    if not hasattr(agent, "_autoagent0_runtime") or agent._autoagent0_runtime is None:
+        agent._autoagent0_runtime = AutoAgent0Runtime(
+            runtime_name=planner_log_name.lower(),
+            logger=LOG,
         )
 
-    reserved_candidate_slots = (
-        max(0, int(rule_based_merge_cfg.topk))
-        if rule_based_merge_cfg.enabled
-        and not agent._vlm_selector_cfg.planner_gate_enabled
-        else 0
+    return LearnedPlannerSelector(
+        vlm_selector=agent._vlm_selector,
+        autoagent0_runtime=agent._autoagent0_runtime,
+        autoagent0_cfg=resolve_autoagent0_config(),
+        vlm_cfg=agent._vlm_selector_cfg,
+        rule_based_merge_cfg=rule_based_merge_cfg,
+        current_source_name=current_source_name,
+        learned_default_source=learned_default_source,
+        plain_source=plain_source,
+        score_fallback_key=score_fallback_key,
+        planner_log_name=planner_log_name,
+        strict_learned_argmax_lookup=strict_learned_argmax_lookup,
+        q_key_prefix=q_key_prefix,
+        logger=LOG,
     )
-    learned_candidate_rows, allow_carry_previous = build_candidate_rows_fn(
-        proposals=proposals,
+
+
+def run_learned_selection(
+    agent,
+    *,
+    proposals_hugsim: np.ndarray,
+    scores: np.ndarray,
+    obs: Dict[str, Any],
+    info: Dict[str, Any],
+    privileged_agents: Optional[List[Dict[str, Any]]],
+) -> tuple[np.ndarray, Optional[float], str, Dict[str, Any]]:
+    agent._learned_selector.frame_index = agent._frame_index
+    plan_payload = agent._learned_selector.select(
+        proposals=proposals_hugsim,
         scores=scores,
-        cfg=adapter_cfg,
-        current_info=info,
-        previous_selected_plan=agent._previous_selected_plan,
-        previous_selected_pose=agent._previous_selected_pose,
-        previous_selected_score=agent._previous_selected_score,
-        previous_selected_timestamp=agent._previous_selected_timestamp,
-        previous_selected_source=agent._previous_selected_source,
-        reserved_candidate_slots=reserved_candidate_slots,
+        obs=obs,
+        info=info,
+        info_history=list(agent._info_history),
+        privileged_info=privileged_agents,
     )
-    rule_based_candidate_rows: List[Dict[str, Any]] = []
-    if rule_based_merge_cfg.enabled:
-        try:
-            from autoagent0.experts.rule_based import (
-                build_rule_based_candidate_rows,
-                get_rule_based_proposals_and_scores,
-            )
-
-            rb_proposals, rb_scores, _ = get_rule_based_proposals_and_scores(
-                rule_based_merge_cfg,
-                obs=obs,
-                info=info,
-                info_history=agent._info_history,
-                privileged_agents=privileged_agents,
-                output_num_poses=output_num_poses,
-                topk=rule_based_merge_cfg.topk,
-            )
-            rule_based_candidate_rows = build_rule_based_candidate_rows(
-                rb_proposals,
-                rb_scores,
-                output_num_poses=output_num_poses,
-                source_name=rule_based_merge_cfg.source_name,
-                topk=rule_based_merge_cfg.topk,
-            )
-        except Exception:
-            LOG.exception(
-                "Failed to append rule-based merge candidates for %s",
-                planner_log_name,
-            )
-
-    from autoagent0.core.config import resolve_autoagent0_config
-
-    autoagent0_cfg = resolve_autoagent0_config()
-    if autoagent0_cfg.enabled:
-        selection = agent._autoagent0_runtime.select_final_actions_recovery_loop(
-            frame_index=agent._frame_index,
-            camera_images=obs.get("rgb", {}),
-            info=info,
-            vlm_selector=agent._vlm_selector,
-            scores=scores,
-            learned_candidate_rows=learned_candidate_rows,
-            rule_based_candidate_rows=rule_based_candidate_rows,
-            redesign_candidate_budget=autoagent0_cfg.redesign_candidate_budget,
-            learned_source_name=learned_source_name,
-            learned_default_source=learned_default_source,
-            score_fallback_key=score_fallback_key,
-            planner_log_name=planner_log_name,
-            logger=LOG,
-            strict_learned_argmax_lookup=strict_learned_argmax_lookup,
-            fallback_mode=autoagent0_cfg.fallback_mode,
-            max_redesign_attempts=autoagent0_cfg.max_redesign_attempts,
-        )
-    else:
-        selection = agent._autoagent0_runtime.select_final_actions(
-            frame_index=agent._frame_index,
-            camera_images=obs.get("rgb", {}),
-            info=info,
-            vlm_selector=agent._vlm_selector,
-            scores=scores,
-            learned_candidate_rows=learned_candidate_rows,
-            rule_based_candidate_rows=rule_based_candidate_rows,
-            rule_based_merge_enabled=rule_based_merge_cfg.enabled,
-            planner_gate_enabled=agent._vlm_selector_cfg.planner_gate_enabled,
-            vlm_enabled=agent._vlm_selector_cfg.enabled,
-            display_default_trajectories=agent._vlm_selector_cfg.display_default_trajectories,
-            include_default_candidates=agent._vlm_selector_cfg.include_default_candidates,
-            allow_carry_previous=allow_carry_previous,
-            previous_selected_source=agent._previous_selected_source,
-            learned_source_name=learned_source_name,
-            learned_default_source=learned_default_source,
-            score_fallback_key=score_fallback_key,
-            planner_log_name=planner_log_name,
-            logger=LOG,
-            strict_learned_argmax_lookup=strict_learned_argmax_lookup,
-            q_key_prefix=q_key_prefix,
-        )
-
-    selected_row = selection.selected_row
-    selected_plan = np.asarray(selection.selected_plan, dtype=np.float32)
-    selected_score_raw = float(selection.selected_score_raw)
-    selected_source = str(selection.selected_source)
-    if selected_row.get("source") == "carry_prev":
-        selected_source = "carry_prev"
-    return selected_plan, selected_score_raw, selected_source
+    selected_plan = np.asarray(plan_payload["selected_plan"], dtype=np.float32)
+    selected_score = plan_payload.get("selected_score")
+    selected_score_raw = (
+        None if selected_score is None else float(selected_score)
+    )
+    selected_source = str(plan_payload.get("selected_source", ""))
+    return selected_plan, selected_score_raw, selected_source, plan_payload
 
 def setup_rap(agent):
     import torch
@@ -686,22 +971,18 @@ def setup_rap(agent):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from planners.rap import client as rap_client
+    from autoagent0.planners.rap import planner as rap_client
     from autoagent0.adapters.hugsim.geometry import info_to_pose
-    from autoagent0.core.runtime import AutoAgent0Runtime
 
     agent._rap_client = rap_client
     agent._info_to_pose = info_to_pose
-    agent._autoagent0_runtime = AutoAgent0Runtime(runtime_name="rap", logger=LOG)
 
-    vlm_dict = rap_cfg.get("vlm", {})
-    setup_vlm_selector(agent, vlm_dict)
     apply_rule_based_merge_env(
         rap_cfg.get("rule_based_merge", {}),
         str(rap_cfg.get("python_bin", sys.executable)),
         ("PLANNER_RULE_BASED_", "RAP_RULE_BASED_"),
     )
-    rule_based_merge = resolve_rule_based_merge(
+    agent._rap_rule_based_merge = resolve_rule_based_merge(
         rap_cfg, ("PLANNER_RULE_BASED_", "RAP_RULE_BASED_")
     )
 
@@ -727,8 +1008,6 @@ def setup_rap(agent):
         output_num_poses=int(
             rap_cfg.get("output_num_poses", rap_client.DEFAULT_OUTPUT_POSES)
         ),
-        vlm=agent._vlm_selector_cfg,
-        rule_based_merge=rule_based_merge,
     )
 
     LOG.info(
@@ -742,7 +1021,21 @@ def setup_rap(agent):
     )
     agent._rap_model = rap_client.load_rap_model(agent._rap_adapter_cfg)
     LOG.info("RAP model loaded OK (output_num_poses=%d)", agent._rap_adapter_cfg.output_num_poses)
-    init_selection_state(agent)
+
+    vlm_dict = rap_cfg.get("vlm", {})
+    setup_vlm_selector(agent, vlm_dict, planner_cfg=rap_cfg)
+
+    agent._learned_selector = create_learned_planner_selector(
+        agent,
+        rule_based_merge_cfg=agent._rap_rule_based_merge,
+        current_source_name="current_rap",
+        learned_default_source="fallback_rap_argmax",
+        plain_source="rap_argmax",
+        score_fallback_key="rap_score",
+        planner_log_name="RAP",
+        strict_learned_argmax_lookup=True,
+        q_key_prefix=True,
+    )
 
 def setup_drivor(agent):
     import torch
@@ -771,18 +1064,12 @@ def setup_drivor(agent):
         sys.path.insert(0, str(repo_root))
 
     from navsim.agents.drivoR.drivor_agent import DrivoRAgent
-    from planners.drivor import client as drivor_client
+    from autoagent0.planners.drivor import planner as drivor_client
     from autoagent0.adapters.hugsim.geometry import info_to_pose
-    from autoagent0.core.runtime import AutoAgent0Runtime
 
     agent._drivor_client = drivor_client
     agent._info_to_pose = info_to_pose
-    agent._autoagent0_runtime = AutoAgent0Runtime(
-        runtime_name="drivor", logger=LOG
-    )
 
-    vlm_dict = drivor_cfg.get("vlm", {})
-    setup_vlm_selector(agent, vlm_dict)
     apply_rule_based_merge_env(
         drivor_cfg.get("rule_based_merge", {}),
         str(drivor_cfg.get("python_bin", sys.executable)),
@@ -846,7 +1133,21 @@ def setup_drivor(agent):
         "DrivoR agent initialized OK (output_num_poses=%d)",
         agent._drivor_output_num_poses,
     )
-    init_selection_state(agent)
+
+    vlm_dict = drivor_cfg.get("vlm", {})
+    setup_vlm_selector(agent, vlm_dict, planner_cfg=drivor_cfg)
+
+    agent._learned_selector = create_learned_planner_selector(
+        agent,
+        rule_based_merge_cfg=agent._drivor_rule_based_merge,
+        current_source_name="current_drivor",
+        learned_default_source="drivor_argmax",
+        plain_source="drivor_argmax",
+        score_fallback_key="proposal_score",
+        planner_log_name="DrivoR",
+        strict_learned_argmax_lookup=False,
+        q_key_prefix=False,
+    )
 
 
 def run_step_rule_based(agent, ego_state):
@@ -960,6 +1261,15 @@ def run_step_rule_based(agent, ego_state):
     if selected_plan is None or len(selected_plan) == 0:
         return brake_control()
 
+    agent._step_viz = build_step_viz_payload(
+        selected_plan=selected_plan,
+        selected_source=selected_source,
+        selected_score=selected_score_raw,
+        proposals=proposals,
+        scores=scores,
+        output_num_poses=output_num_poses,
+    )
+
     try:
         acc_cmd, steer_rate = traj_to_control(selected_plan, info)
     except Exception:
@@ -995,7 +1305,10 @@ def run_step_rap(agent, ego_state):
             return brake_control()
 
     privileged_agents = None
-    if cfg.rule_based_merge.enabled and cfg.rule_based_merge.include_privileged_info:
+    if (
+        agent._rap_rule_based_merge.enabled
+        and agent._rap_rule_based_merge.include_privileged_info
+    ):
         privileged_agents = get_privileged_info(agent, info)
 
     try:
@@ -1010,33 +1323,38 @@ def run_step_rap(agent, ego_state):
         LOG.exception("RAP inference failed")
         return brake_control()
 
+    proposals_hugsim = np.stack(
+        [
+            rap.rap_to_hugsim_plan(proposals[i, : cfg.output_num_poses])
+            for i in range(proposals.shape[0])
+        ],
+        axis=0,
+    ).astype(np.float32)
+
     try:
-        selected_plan, selected_score_raw, selected_source = (
-            select_learned_plan(agent, 
+        selected_plan, selected_score_raw, selected_source, _plan_payload = (
+            run_learned_selection(
+                agent,
+                proposals_hugsim=proposals_hugsim,
+                scores=scores,
                 obs=obs,
                 info=info,
-                scores=scores,
-                proposals=proposals,
-                output_num_poses=cfg.output_num_poses,
-                build_candidate_rows_fn=rap.build_vlm_candidate_rows,
-                adapter_cfg=cfg,
-                rule_based_merge_cfg=cfg.rule_based_merge,
                 privileged_agents=privileged_agents,
-                learned_source_name="current_rap",
-                learned_default_source="fallback_rap_argmax",
-                score_fallback_key="rap_score",
-                planner_log_name="RAP",
-                strict_learned_argmax_lookup=True,
-                q_key_prefix=True,
-                plain_result_fn=lambda p, s, n: rap.build_plain_rap_plan_result(
-                    p, s, cfg
-                ),
             )
         )
     except Exception:
         LOG.exception("RAP plan selection failed")
         return brake_control()
 
+    agent._step_viz = build_step_viz_payload(
+        selected_plan=selected_plan,
+        selected_source=selected_source,
+        selected_score=selected_score_raw,
+        proposals=proposals_hugsim,
+        scores=scores,
+        output_num_poses=cfg.output_num_poses,
+        proposals_already_hugsim=True,
+    )
     return apply_plan_control(agent, 
         selected_plan, info, selected_score_raw, selected_source
     )
@@ -1087,60 +1405,45 @@ def run_step_drivor(agent, ego_state):
                 LOG.exception("DrivoR agent.forward failed; trying internal model")
                 predictions = agent._drivor_agent._drivor_model(features_batched)
 
-        proposals, scores = drivor.extract_proposals_and_scores_from_predictions(
+        proposals_raw, scores = drivor.extract_proposals_and_scores_from_predictions(
             predictions, output_num_poses=output_num_poses
         )
     except Exception:
         LOG.exception("DrivoR inference failed")
         return brake_control()
 
-    class _DrivorAdapterCfg:
-        def __init__(self, vlm_cfg, output_num_poses):
-            agent.vlm = vlm_cfg
-            agent.output_num_poses = output_num_poses
-
-    adapter_cfg = _DrivorAdapterCfg(agent._vlm_selector_cfg, output_num_poses)
-
-    def _build_rows(proposals, scores, cfg, **kwargs):
-        return drivor.build_drivor_candidate_rows(
-            proposals=proposals,
-            scores=scores,
-            output_num_poses=output_num_poses,
-            vlm_cfg=cfg.vlm,
-            current_info=kwargs["current_info"],
-            previous_selected_plan=kwargs.get("previous_selected_plan"),
-            previous_selected_pose=kwargs.get("previous_selected_pose"),
-            previous_selected_score=kwargs.get("previous_selected_score"),
-            previous_selected_timestamp=kwargs.get("previous_selected_timestamp"),
-            previous_selected_source=kwargs.get("previous_selected_source"),
-            reserved_candidate_slots=kwargs.get("reserved_candidate_slots", 0),
-        )
+    proposals_hugsim = np.stack(
+        [
+            drivor.drivor_to_hugsim_plan(proposals_raw[i, :output_num_poses])
+            for i in range(proposals_raw.shape[0])
+        ],
+        axis=0,
+    ).astype(np.float32)
 
     try:
-        selected_plan, selected_score_raw, selected_source = (
-            select_learned_plan(agent, 
+        selected_plan, selected_score_raw, selected_source, _plan_payload = (
+            run_learned_selection(
+                agent,
+                proposals_hugsim=proposals_hugsim,
+                scores=scores,
                 obs=obs,
                 info=info,
-                scores=scores,
-                proposals=proposals,
-                output_num_poses=output_num_poses,
-                build_candidate_rows_fn=_build_rows,
-                adapter_cfg=adapter_cfg,
-                rule_based_merge_cfg=agent._drivor_rule_based_merge,
                 privileged_agents=privileged_agents,
-                learned_source_name="current_drivor",
-                learned_default_source="drivor_argmax",
-                score_fallback_key="proposal_score",
-                planner_log_name="DrivoR",
-                strict_learned_argmax_lookup=False,
-                q_key_prefix=False,
-                plain_result_fn=drivor.build_plain_drivor_plan_result,
             )
         )
     except Exception:
         LOG.exception("DrivoR plan selection failed")
         return brake_control()
 
+    agent._step_viz = build_step_viz_payload(
+        selected_plan=selected_plan,
+        selected_source=selected_source,
+        selected_score=selected_score_raw,
+        proposals=proposals_hugsim,
+        scores=scores,
+        output_num_poses=output_num_poses,
+        proposals_already_hugsim=True,
+    )
     return apply_plan_control(agent, 
         selected_plan, info, selected_score_raw, selected_source
     )
@@ -1172,6 +1475,9 @@ def setup_cameras_and_recording(agent):
     agent._recording_save_grid_video = coerce_bool(
         rec_cfg.get("save_grid_video", True), default=True
     )
+    agent._recording_save_topdown_video = coerce_bool(
+        rec_cfg.get("save_topdown_video", False), default=False
+    )
     agent._recording_fps = float(rec_cfg.get("fps", 20.0))
     agent._recording_frame_ext = str(
         rec_cfg.get("frame_format", "jpg")
@@ -1179,9 +1485,28 @@ def setup_cameras_and_recording(agent):
 
     dir_name = str(rec_cfg.get("dir_name", "recordings"))
     agent._recording_dir = agent._output_dir / dir_name
-    agent._video_buffers: Dict[str, List[np.ndarray]] = {}
     agent._grid_video_buffer: List[np.ndarray] = []
+    agent._topdown_video_buffer: List[np.ndarray] = []
     agent._recording_finalized = False
+    agent._predictions_dir = resolve_predictions_dir(agent)
+    agent._topdown_camera_spec = None
+    agent._topdown_pixels_per_meter = 10.0
+
+    wants_topdown = (
+        agent._recording_save_topdown_video
+        or agent._predictions_dir is not None
+    )
+    if wants_topdown:
+        agent._topdown_camera_spec = build_topdown_camera_spec(carla_cfg)
+        agent._topdown_pixels_per_meter = topdown_pixels_per_meter(
+            int(agent._topdown_camera_spec["width"]),
+            float(agent._topdown_camera_spec["fov"]),
+            float(agent._topdown_camera_spec["z"]),
+        )
+        if not any(
+            spec["id"] == TOPDOWN_CAMERA_ID for spec in agent._camera_specs
+        ):
+            agent._camera_specs.append(agent._topdown_camera_spec)
 
     if agent._recording_enabled and not agent._camera_specs:
         agent._camera_specs = [_build_camera_spec("CAM_FRONT", carla_cfg)]
@@ -1195,9 +1520,11 @@ def setup_cameras_and_recording(agent):
             for spec in agent._camera_specs:
                 (agent._recording_dir / spec["id"]).mkdir(exist_ok=True)
         LOG.info(
-            "Recording enabled -> %s (cameras=%s)",
+            "Recording enabled -> %s (cameras=%s, topdown=%s, predictions=%s)",
             agent._recording_dir,
             [spec["id"] for spec in agent._camera_specs],
+            agent._recording_save_topdown_video,
+            agent._predictions_dir,
         )
     elif agent._camera_specs:
         LOG.info(
@@ -1214,35 +1541,42 @@ def maybe_record_frames(agent, ego_state: Dict[str, Any]) -> None:
         return
 
     frame_idx = agent._frame_index
-    for cam_id, rgb in obs_rgb.items():
-        if agent._recording_save_frames:
+    if agent._recording_save_frames:
+        for cam_id, rgb in obs_rgb.items():
+            if cam_id == TOPDOWN_CAMERA_ID:
+                continue
             frame_path = (
                 agent._recording_dir
                 / cam_id
                 / f"{frame_idx:05d}.{agent._recording_frame_ext}"
             )
+            frame_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(
                 str(frame_path),
                 cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
             )
-        if agent._recording_save_video:
-            agent._video_buffers.setdefault(cam_id, []).append(rgb.copy())
 
     if agent._recording_save_grid_video and len(obs_rgb) > 1:
-        grid = compose_grid_frame(obs_rgb, VIDEO_GRID_LAYOUT)
-        if grid is not None:
-            agent._grid_video_buffer.append(grid)
-            if agent._recording_save_frames:
-                grid_dir = agent._recording_dir / "grid"
-                grid_dir.mkdir(exist_ok=True)
-                grid_path = (
-                    grid_dir
-                    / f"{frame_idx:05d}.{agent._recording_frame_ext}"
-                )
-                cv2.imwrite(
-                    str(grid_path),
-                    cv2.cvtColor(grid, cv2.COLOR_RGB2BGR),
-                )
+        grid_rgb = {
+            cam_id: rgb
+            for cam_id, rgb in obs_rgb.items()
+            if cam_id != TOPDOWN_CAMERA_ID
+        }
+        if len(grid_rgb) > 1:
+            grid = compose_grid_frame(grid_rgb, VIDEO_GRID_LAYOUT)
+            if grid is not None:
+                agent._grid_video_buffer.append(grid)
+                if agent._recording_save_frames:
+                    grid_dir = agent._recording_dir / "grid"
+                    grid_dir.mkdir(exist_ok=True)
+                    grid_path = (
+                        grid_dir
+                        / f"{frame_idx:05d}.{agent._recording_frame_ext}"
+                    )
+                    cv2.imwrite(
+                        str(grid_path),
+                        cv2.cvtColor(grid, cv2.COLOR_RGB2BGR),
+                    )
 
 def write_rgb_video(
     out_path: Path, frames: List[np.ndarray], fps: float
@@ -1265,27 +1599,26 @@ def finalize_recording(agent) -> None:
     agent._recording_finalized = True
     if not getattr(agent, "_recording_enabled", False):
         return
-    if not getattr(agent, "_recording_save_video", False):
-        return
 
     fps = max(1.0, float(getattr(agent, "_recording_fps", 20.0)))
-    for cam_id, frames in agent._video_buffers.items():
-        if not frames:
-            continue
-        if cam_id == "CAM_FRONT" and agent._recording_save_front_video:
-            out_path = agent._recording_dir / "front.mp4"
-        else:
-            out_path = agent._recording_dir / f"{cam_id.lower()}.mp4"
-        write_rgb_video(out_path, frames, fps)
-        LOG.info("Wrote camera video: %s (%d frames)", out_path, len(frames))
 
-    if agent._grid_video_buffer:
+    if getattr(agent, "_recording_save_grid_video", False) and agent._grid_video_buffer:
         grid_path = agent._recording_dir / "grid.mp4"
         write_rgb_video(grid_path, agent._grid_video_buffer, fps)
         LOG.info(
             "Wrote grid video: %s (%d frames)",
             grid_path,
             len(agent._grid_video_buffer),
+        )
+
+    topdown_buffer = getattr(agent, "_topdown_video_buffer", [])
+    if getattr(agent, "_recording_save_topdown_video", False) and topdown_buffer:
+        topdown_path = agent._recording_dir / "topdown.mp4"
+        write_rgb_video(topdown_path, topdown_buffer, fps)
+        LOG.info(
+            "Wrote topdown video: %s (%d frames)",
+            topdown_path,
+            len(topdown_buffer),
         )
 
 # ------------------------------------------------------------------
@@ -1318,6 +1651,7 @@ def get_ego_state(agent, hero, input_data, timestamp):
 
     obs: Dict[str, Any] = {"rgb": {}}
     front_rgb = None
+    topdown_rgb = None
     for spec in getattr(agent, "_camera_specs", []):
         cam_id = spec["id"]
         rgb = rgb_from_input_data(input_data, cam_id)
@@ -1325,6 +1659,8 @@ def get_ego_state(agent, hero, input_data, timestamp):
             obs["rgb"][cam_id] = rgb
             if cam_id == "CAM_FRONT":
                 front_rgb = rgb
+            if cam_id == TOPDOWN_CAMERA_ID:
+                topdown_rgb = rgb
 
     bbox = hero.bounding_box
     ego_box = np.array([
@@ -1367,6 +1703,7 @@ def get_ego_state(agent, hero, input_data, timestamp):
         "info": info,
         "obs": obs,
         "front_rgb": front_rgb,
+        "topdown_rgb": topdown_rgb,
         "speed_mps": speed_mps,
         "transform": transform,
     }

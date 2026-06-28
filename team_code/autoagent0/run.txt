@@ -25,7 +25,7 @@ python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
   --agent-config $WORK_DIR/configs/drivor.yaml
 
 # running VLM with intervention
-bash /data2/autoagent0/f2d_carla/CarlaUE4.sh -RenderOffScreen -quality-level=Low
+bash /data2/autoagent0/f2d_carla/CarlaUE4.sh -RenderOffScreen -quality-level=Low -graphicsadapter=5
 
 # drivor + vlm intervention
 cd /data/robert/fail2drive
@@ -36,7 +36,7 @@ python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
   --timeout 1200 \
   --routes /data/robert/fail2drive/fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
   --agent /data/robert/fail2drive/team_code/autoagent0_agent.py \
-  --agent-config /data/robert/fail2drive/configs/drivor_vlm_intervention_4cam.yaml \
+  --agent-config /data/robert/fail2drive/configs/drivor.yaml \
   --track SENSORS
 
 # rap + vlm intervention
@@ -45,7 +45,18 @@ conda activate /data/robert/fail2drive/env
 source /data/robert/fail2drive/env_vars.sh
 
 python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
-  --routes /data/robert/fail2drive/fail2drive_split/Generalization_PedestriansOnRoad_1085.xml \
+  --routes /data/robert/fail2drive/fail2drive_split/Generalization_CustomObstacles_1022.xml \
   --agent /data/robert/fail2drive/team_code/autoagent0_agent.py \
   --agent-config /data/robert/fail2drive/configs/rap_vlm_intervention_4cam.yaml \
+  --track SENSORS
+
+cd /data/robert/fail2drive
+conda deactivate && conda activate /data/robert/fail2drive/env
+source /data/robert/fail2drive/env_vars.sh
+
+python $LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py \
+  --timeout 1200 \
+  --routes /data/robert/fail2drive/fail2drive_split/Generalization_CustomObstacles_1022.xml \
+  --agent /data/robert/fail2drive/team_code/autoagent0_agent.py \
+  --agent-config /data/robert/fail2drive/configs/drivor_vlm_intervention_4cam.yaml \
   --track SENSORS

@@ -35,6 +35,7 @@ from autoagent0_carla_helper import (
     setup_drivor,
     setup_rap,
     setup_rule_based,
+    resolve_scenario_output_dir,
 )
 
 LOG = logging.getLogger(__name__)
@@ -45,6 +46,11 @@ def get_entry_point():
 
 
 class AutoAgent0CarlaAgent(AutonomousAgent):
+
+    def set_route_context(self, route_name: str, repetition_index: int = 0) -> None:
+        """Called by the leaderboard before setup() for each route."""
+        self._route_name = str(route_name)
+        self._repetition_index = int(repetition_index)
 
     def setup(self, path_to_conf_file):
         self.track = Track.SENSORS
@@ -65,11 +71,17 @@ class AutoAgent0CarlaAgent(AutonomousAgent):
             )
         LOG.info("AutoAgent0: planner_type=%s", self._planner_type)
 
-        output_dir = Path(
+        base_output_dir = Path(
             self._carla_cfg.get("output_dir", "/tmp/fail2drive_autoagent0")
         )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self._output_dir = output_dir
+        self._output_dir = resolve_scenario_output_dir(
+            self._carla_cfg,
+            base_output_dir=base_output_dir,
+            planner_type=self._planner_type,
+            scenario_name=getattr(self, "_route_name", None),
+            repetition_index=int(getattr(self, "_repetition_index", 0)),
+            config_path=path_to_conf_file,
+        )
 
         self._route_cursor = 0
         self._frame_index = 0

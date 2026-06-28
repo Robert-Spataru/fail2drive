@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,14 @@ _AUTOAGENT0_ROOT = Path("/data/robert/AutoAgent0")
 EGO_HISTORY_FRAMES = 4
 RULE_BASED_TOPK = 10
 PRIVILEGED_AGENT_RADIUS_M = 50.0
+
+# Default time (s) between consecutive plan waypoints. Learned planners
+# (DrivoR/RAP) emit poses every 0.5 s; the rule planner emits every 0.25 s.
+# The actual per-planner value is stored on ``agent._plan_dt_sec`` at setup.
+PLAN_DT_SEC = 0.5
+# CARLA leaderboard runs the world at a fixed 20 Hz (see leaderboard_evaluator),
+# so one control step is 0.05 s. Used as a fallback when timestamps are missing.
+DEFAULT_CONTROL_DT_SEC = 0.05
 
 # HUGSIM-compatible camera names and CARLA ego mounts (meters, degrees).
 CAMERA_MOUNTS: Dict[str, Dict[str, float]] = {
@@ -64,6 +73,11 @@ TOPDOWN_VIZ_TOPK = 5
 TOPDOWN_SELECTED_COLOR_BGR = (80, 255, 80)
 TOPDOWN_CANDIDATE_COLOR_BGR = (200, 200, 200)
 TOPDOWN_EGO_COLOR_BGR = (255, 255, 255)
+# Line thickness for the top-down trajectory overlay. Candidates are drawn thin
+# and colored by rank (best=green -> worst=red); the selected plan is slightly
+# thicker so it stands out without obscuring the ranked candidates.
+TOPDOWN_CANDIDATE_THICKNESS = 1
+TOPDOWN_SELECTED_THICKNESS = 2
 
 
 def navsim_proposal_to_hugsim_plan(trajectory: np.ndarray) -> np.ndarray:
@@ -172,6 +186,23 @@ def _plan_to_pixel_points(
     return np.round(np.stack([xs, ys], axis=1)).astype(np.int32)
 
 
+def _rank_color_bgr(rank_idx: int, num_ranks: int) -> Tuple[int, int, int]:
+    """Map a 0-based rank to a BGR color: rank 0 (best) -> green, last -> red.
+
+    Interpolates hue in OpenCV HSV space from green (H=60) down to red (H=0)
+    so intermediate ranks pass through yellow/orange.
+    """
+    if num_ranks <= 1:
+        frac = 0.0
+    else:
+        frac = float(rank_idx) / float(num_ranks - 1)
+    frac = float(np.clip(frac, 0.0, 1.0))
+    hue = int(round((1.0 - frac) * 60.0))  # 60=green (best) ... 0=red (worst)
+    hsv = np.uint8([[[hue, 255, 255]]])
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+
 def overlay_trajectories_on_topdown(
     image_rgb: np.ndarray,
     viz_payload: Dict[str, Any],
@@ -183,19 +214,34 @@ def overlay_trajectories_on_topdown(
     height, width = img.shape[:2]
     center = ego_center_xy or (width // 2, height // 2)
 
-    for plan in viz_payload.get("candidate_plans", []):
+    # Candidates are already ordered best -> worst, so the index is the rank.
+    candidate_plans = viz_payload.get("candidate_plans", [])
+    num_ranks = len(candidate_plans)
+    for rank_idx, plan in enumerate(candidate_plans):
         pts = _plan_to_pixel_points(
             plan, center_xy=center, pixels_per_meter=pixels_per_meter
         )
         if len(pts) < 2:
             continue
+        color = _rank_color_bgr(rank_idx, num_ranks)  # rank 1 green -> last red
         cv2.polylines(
             img,
             [pts],
             isClosed=False,
-            color=TOPDOWN_CANDIDATE_COLOR_BGR,
-            thickness=1,
+            color=color,
+            thickness=TOPDOWN_CANDIDATE_THICKNESS,
             lineType=cv2.LINE_AA,
+        )
+        end_pt = (int(pts[-1][0]), int(pts[-1][1]))
+        cv2.putText(
+            img,
+            str(rank_idx + 1),
+            end_pt,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            color,
+            1,
+            cv2.LINE_AA,
         )
 
     selected_plan = viz_payload.get("selected_plan")
@@ -211,7 +257,7 @@ def overlay_trajectories_on_topdown(
                 [pts],
                 isClosed=False,
                 color=TOPDOWN_SELECTED_COLOR_BGR,
-                thickness=3,
+                thickness=TOPDOWN_SELECTED_THICKNESS,
                 lineType=cv2.LINE_AA,
             )
 
@@ -255,6 +301,9 @@ def save_predictions_frame(
         "selected_plan": np.asarray(
             viz_payload.get("selected_plan", []), dtype=np.float32
         ).tolist(),
+        # CARLA control actually applied this frame (throttle/brake/steer in
+        # [0,1]/[-1,1]), plus the PID target speed and measured ego speed (m/s).
+        "control": getattr(agent, "_last_applied_control", None),
         "candidates": [
             {
                 "score": float(score),
@@ -307,6 +356,70 @@ def _sanitize_run_id(run_id: str) -> str:
     return cleaned or "run"
 
 
+def resolve_scenario_output_dir(
+    carla_cfg: Dict[str, Any],
+    *,
+    base_output_dir: Path,
+    planner_type: str,
+    scenario_name: Optional[str] = None,
+    repetition_index: int = 0,
+    config_path: Optional[str] = None,
+) -> Path:
+    """Create a per-scenario output directory under base_output_dir/scenarios/.
+
+    When auto_run_id is true (default), each leaderboard route (e.g. RouteScenario_1085)
+    gets its own directory. Re-running the same scenario overwrites that directory.
+    """
+    auto_run_id = coerce_bool(carla_cfg.get("auto_run_id", True), default=True)
+    if not auto_run_id:
+        base_output_dir.mkdir(parents=True, exist_ok=True)
+        return base_output_dir
+
+    scenario_id = carla_cfg.get("scenario_id") or carla_cfg.get("run_id")
+    if not scenario_id:
+        if scenario_name:
+            scenario_id = str(scenario_name)
+            if int(repetition_index) > 0:
+                scenario_id = f"{scenario_id}_rep{int(repetition_index)}"
+        else:
+            scenario_id = f"{planner_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    scenario_id = _sanitize_run_id(str(scenario_id))
+
+    scenarios_parent = (
+        str(carla_cfg.get("scenarios_dir_name", carla_cfg.get("run_dir_name", "scenarios"))).strip()
+        or "scenarios"
+    )
+    scenario_output_dir = base_output_dir / scenarios_parent / scenario_id
+
+    overwrite = coerce_bool(carla_cfg.get("overwrite_scenario_output", True), default=True)
+    if scenario_output_dir.exists() and overwrite:
+        shutil.rmtree(scenario_output_dir)
+    scenario_output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "scenario_id": scenario_id,
+        "scenario_name": scenario_name,
+        "repetition_index": int(repetition_index),
+        "planner_type": planner_type,
+        "base_output_dir": str(base_output_dir),
+        "scenario_output_dir": str(scenario_output_dir),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "config_path": config_path,
+        "overwrite": overwrite,
+    }
+    manifest_path = scenario_output_dir / "run_info.json"
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    LOG.info(
+        "Scenario output directory: %s (scenario_id=%s, overwrite=%s)",
+        scenario_output_dir,
+        scenario_id,
+        overwrite,
+    )
+    return scenario_output_dir
+
+
 def resolve_run_output_dir(
     carla_cfg: Dict[str, Any],
     *,
@@ -314,35 +427,13 @@ def resolve_run_output_dir(
     planner_type: str,
     config_path: Optional[str] = None,
 ) -> Path:
-    """Create a unique per-run output directory under base_output_dir/runs/."""
-    auto_run_id = coerce_bool(carla_cfg.get("auto_run_id", True), default=True)
-    if not auto_run_id:
-        base_output_dir.mkdir(parents=True, exist_ok=True)
-        return base_output_dir
-
-    run_id = carla_cfg.get("run_id")
-    if not run_id:
-        run_id = f"{planner_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_id = _sanitize_run_id(str(run_id))
-
-    runs_parent = str(carla_cfg.get("run_dir_name", "runs")).strip() or "runs"
-    run_output_dir = base_output_dir / runs_parent / run_id
-    run_output_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = {
-        "run_id": run_id,
-        "planner_type": planner_type,
-        "base_output_dir": str(base_output_dir),
-        "run_output_dir": str(run_output_dir),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "config_path": config_path,
-    }
-    manifest_path = run_output_dir / "run_info.json"
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2)
-
-    LOG.info("Run output directory: %s (run_id=%s)", run_output_dir, run_id)
-    return run_output_dir
+    """Backward-compatible alias for resolve_scenario_output_dir."""
+    return resolve_scenario_output_dir(
+        carla_cfg,
+        base_output_dir=base_output_dir,
+        planner_type=planner_type,
+        config_path=config_path,
+    )
 
 
 def coerce_bool(value: Any, default: bool = False) -> bool:
@@ -651,6 +742,12 @@ def setup_rule_based(agent):
     agent._rule_planner = PrivilegedPlannerService(config=planner_config)
     LOG.info("PrivilegedPlannerService initialized OK")
 
+    # The rule planner emits poses at its native dt (0.25 s by default), NOT the
+    # 0.5 s the LQR assumes. Record it so the longitudinal controller derives the
+    # correct target speed (this is the rule-planner dt fix).
+    agent._plan_dt_sec = float(getattr(agent._rule_planner, "dt", 0.25))
+    LOG.info("Rule-based plan_dt_sec=%.3f", agent._plan_dt_sec)
+
     # Determine output_num_poses from config (same as client.py)
     try:
         agent._rule_based_output_num_poses = int(
@@ -712,6 +809,12 @@ def init_selection_state(agent) -> None:
     agent._previous_selected_score = None
     agent._previous_selected_timestamp = None
     agent._previous_selected_source = None
+    # Longitudinal PID state (reset per scenario/setup).
+    agent._lon_pid_integral = 0.0
+    agent._lon_pid_prev_error = 0.0
+    agent._previous_control_timestamp = None
+    agent._last_target_speed = None
+    agent._last_applied_control = None
 
 def apply_rule_based_merge_env(
     rb_merge_dict: Optional[Dict[str, Any]],
@@ -799,6 +902,199 @@ def setup_vlm_selector(
         agent._vlm_selector = None
         LOG.info("VLM disabled")
 
+# ----------------------------------------------------------------------------
+# Longitudinal control
+#
+# The LQR (``plan2control``) tracks the *position* of the reference path and
+# returns an acceleration command in m/s^2. The original code mapped that
+# straight onto CARLA's [0,1] throttle/brake pedals. That is wrong for two
+# reasons:
+#   1. m/s^2 != pedal fraction (a unit mismatch), and
+#   2. CARLA's Lincoln MKZ has real aerodynamic drag + rolling resistance, so
+#      holding a speed needs a *positive* throttle. When the planner is happy
+#      (acc_cmd ~ 0) the old mapping commanded throttle ~ 0, the car coasted
+#      down, and -- because the learned planners condition on ego speed -- it
+#      got stuck in a slow-creep equilibrium.
+# The fix: derive a *target speed* from the plan (using a lookahead so we don't
+# track the tiny front-loaded first step), then drive a speed PID with a drag
+# feed-forward term. The LQR is still used, but only for steering.
+# ----------------------------------------------------------------------------
+
+
+def _longitudinal_cfg(agent) -> Dict[str, Any]:
+    return dict((getattr(agent, "_carla_cfg", {}) or {}).get("longitudinal", {}) or {})
+
+
+def _control_dt_sec(agent, info: Dict[str, Any]) -> float:
+    """Wall-clock seconds since the previous control step (for PID timing)."""
+    now = float(info.get("timestamp", 0.0))
+    prev = getattr(agent, "_previous_control_timestamp", None)
+    agent._previous_control_timestamp = now
+    if prev is None:
+        return DEFAULT_CONTROL_DT_SEC
+    dt = now - prev
+    if not np.isfinite(dt) or dt <= 1e-3 or dt > 1.0:
+        return DEFAULT_CONTROL_DT_SEC
+    return float(dt)
+
+
+def _plan_target_speed(
+    plan: np.ndarray,
+    plan_dt: float,
+    *,
+    lookahead_time: float,
+    max_speed: float,
+) -> float:
+    """Estimate the plan's intended cruise speed (m/s).
+
+    ``plan`` is HUGSIM-local ``[x_right, y_forward]`` with waypoints ``plan_dt``
+    seconds apart. We compute per-segment speeds (including ego->first pose) and
+    take the **max** over a short lookahead window. Using the max (rather than
+    the first segment) avoids the front-loaded "accelerate later" trap where the
+    immediate step is near zero but the plan clearly intends to speed up.
+    """
+    plan = np.asarray(plan, dtype=np.float32)
+    if plan.ndim != 2 or len(plan) == 0 or plan_dt <= 0.0:
+        return 0.0
+    pts = np.vstack([np.zeros((1, 2), dtype=np.float32), plan[:, :2]])
+    seg_dist = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    seg_speed = seg_dist / float(plan_dt)
+    n_look = max(1, int(round(float(lookahead_time) / float(plan_dt))))
+    window = seg_speed[:n_look]
+    target = float(np.max(window)) if window.size else 0.0
+    return float(np.clip(target, 0.0, float(max_speed)))
+
+def _longitudinal_pid(
+    agent,
+    *,
+    target_speed: float,
+    current_speed: float,
+    control_dt: float,
+) -> Tuple[float, float]:
+    """Speed-tracking PID with a drag feed-forward term -> (throttle, brake)."""
+    lon = _longitudinal_cfg(agent)
+    kp = float(lon.get("kp", 0.4))
+    ki = float(lon.get("ki", 0.05))
+    kd = float(lon.get("kd", 0.0))
+    ff_gain = float(lon.get("feedforward_gain", 0.06))   # throttle per m/s to fight drag
+    ff_const = float(lon.get("feedforward_const", 0.0))  # static throttle offset
+    integral_clamp = float(lon.get("integral_clamp", 1.0))
+    brake_gain = float(lon.get("brake_gain", 1.0))
+    stop_speed = float(lon.get("stop_speed", 0.3))       # below this target -> brake
+    throttle_gain = float(lon.get("throttle_gain", 1.0)) # overall throttle scale
+
+    error = float(target_speed) - float(current_speed)
+
+    integral = float(getattr(agent, "_lon_pid_integral", 0.0)) + error * control_dt
+    integral = float(np.clip(integral, -integral_clamp, integral_clamp))
+    prev_error = float(getattr(agent, "_lon_pid_prev_error", error))
+    derivative = (error - prev_error) / control_dt if control_dt > 0 else 0.0
+    agent._lon_pid_integral = integral
+    agent._lon_pid_prev_error = error
+
+    feedforward = ff_const + ff_gain * float(target_speed) if target_speed > stop_speed else 0.0
+    command = kp * error + ki * integral + kd * derivative + feedforward
+
+    if target_speed <= stop_speed:
+        # Plan wants to (nearly) stop: brake proportionally to current speed.
+        return 0.0, float(np.clip(max(-command, 0.0) + 0.3, 0.0, 1.0))
+
+    if command >= 0.0:
+        return float(np.clip(command * throttle_gain, 0.0, 1.0)), 0.0
+    return 0.0, float(np.clip(-command * brake_gain, 0.0, 1.0))
+
+
+def _log_speed_diagnostics(
+    agent,
+    plan: np.ndarray,
+    info: Dict[str, Any],
+    source: str,
+    *,
+    target_speed: float,
+    throttle: float,
+    brake: float,
+) -> None:
+    try:
+        plan = np.asarray(plan, dtype=np.float32)
+        plan_dt = float(getattr(agent, "_plan_dt_sec", PLAN_DT_SEC))
+        ego = float(info.get("ego_velo", 0.0))
+        first = float(np.linalg.norm(plan[0])) if len(plan) else 0.0
+        implied = first / plan_dt if plan_dt > 0 else 0.0
+        LOG.info(
+            "speed_diag src=%s ego=%.2f m/s (%.1f km/h) plan_step1=%.2f m/s "
+            "target=%.2f m/s thr=%.2f brk=%.2f",
+            source, ego, ego * 3.6, implied, float(target_speed), float(throttle), float(brake),
+        )
+    except Exception:
+        pass
+
+
+def _compute_throttle_brake(
+    agent,
+    selected_plan: np.ndarray,
+    info: Dict[str, Any],
+    acc_cmd: float,
+    selected_source: str,
+) -> Tuple[float, float]:
+    """Dispatch to the configured longitudinal controller.
+
+    mode: "pid" (default) -> target-speed PID + drag feed-forward
+          "raw"           -> original acc_cmd-as-pedal behavior (vehicle moves slowly)
+    """
+    lon = _longitudinal_cfg(agent)
+    mode = str(lon.get("mode", "pid")).lower()
+    plan_dt = float(getattr(agent, "_plan_dt_sec", PLAN_DT_SEC))
+
+    if mode == "raw":
+        throttle = float(np.clip(acc_cmd, 0.0, 1.0))
+        brake = float(np.clip(-acc_cmd, 0.0, 1.0))
+        target_speed = float("nan")
+    else:  # "pid"
+        max_speed = float(lon.get("max_speed", 20.1))  # ~45 mph
+        lookahead_time = float(lon.get("lookahead_time", 2.0))
+        target_speed = _plan_target_speed(
+            selected_plan, plan_dt,
+            lookahead_time=lookahead_time, max_speed=max_speed,
+        )
+        throttle, brake = _longitudinal_pid(
+            agent,
+            target_speed=target_speed,
+            current_speed=float(info.get("ego_velo", 0.0)),
+            control_dt=_control_dt_sec(agent, info),
+        )
+
+    agent._last_target_speed = target_speed
+
+    if coerce_bool(lon.get("debug", True), default=True):
+        _log_speed_diagnostics(
+            agent, selected_plan, info, selected_source,
+            target_speed=target_speed, throttle=throttle, brake=brake,
+        )
+    return throttle, brake
+
+
+def _record_applied_control(
+    agent,
+    ctrl: carla.VehicleControl,
+    info: Dict[str, Any],
+    *,
+    target_speed: Optional[float] = None,
+) -> None:
+    """Stash the control actually sent to CARLA so it can be saved per frame."""
+    ts: Optional[float]
+    if target_speed is None or not np.isfinite(target_speed):
+        ts = None
+    else:
+        ts = float(target_speed)
+    agent._last_applied_control = {
+        "throttle": float(ctrl.throttle),
+        "brake": float(ctrl.brake),
+        "steer": float(ctrl.steer),
+        "target_speed": ts,
+        "ego_velo": float(info.get("ego_velo", 0.0)),
+    }
+
+
 def apply_plan_control(
     agent,
     selected_plan: Optional[np.ndarray],
@@ -807,12 +1103,16 @@ def apply_plan_control(
     selected_source: str,
 ) -> carla.VehicleControl:
     if selected_plan is None or len(selected_plan) == 0:
-        return brake_control()
+        fallback = brake_control()
+        _record_applied_control(agent, fallback, info)
+        return fallback
     try:
         acc_cmd, steer_rate = traj_to_control(selected_plan, info)
     except Exception:
         LOG.exception("traj2control failed")
-        return brake_control()
+        fallback = brake_control()
+        _record_applied_control(agent, fallback, info)
+        return fallback
 
     agent._previous_selected_plan = np.asarray(
         selected_plan, dtype=np.float32
@@ -822,13 +1122,21 @@ def apply_plan_control(
     agent._previous_selected_timestamp = float(info.get("timestamp", 0.0))
     agent._previous_selected_source = selected_source
 
+    throttle, brake = _compute_throttle_brake(
+        agent, selected_plan, info, float(acc_cmd), selected_source
+    )
+
     ctrl = carla.VehicleControl()
+    # Steering still comes from the LQR (lateral tracking unchanged).
     ctrl.steer = float(np.clip(steer_rate, -1.0, 1.0))
-    ctrl.throttle = float(np.clip(acc_cmd, 0.0, 1.0))
-    ctrl.brake = float(np.clip(-acc_cmd, 0.0, 1.0))
+    ctrl.throttle = throttle
+    ctrl.brake = brake
     ctrl.hand_brake = False
     ctrl.manual_gear_shift = False
     agent._last_steer = ctrl.steer
+    _record_applied_control(
+        agent, ctrl, info, target_speed=getattr(agent, "_last_target_speed", None)
+    )
     return ctrl
 
 def export_rap_env(rap_cfg: Dict[str, Any]) -> None:
@@ -1037,6 +1345,10 @@ def setup_rap(agent):
         q_key_prefix=True,
     )
 
+    # RAP emits poses every 0.5 s (matches the LQR's discretization_time).
+    agent._plan_dt_sec = float(rap_cfg.get("plan_dt_sec", 0.5))
+    init_selection_state(agent)
+
 def setup_drivor(agent):
     import torch
     from omegaconf import OmegaConf
@@ -1148,6 +1460,11 @@ def setup_drivor(agent):
         strict_learned_argmax_lookup=False,
         q_key_prefix=False,
     )
+
+    # DrivoR emits poses every 0.5 s (interval_length in drivoR.yaml; matches the
+    # LQR's discretization_time).
+    agent._plan_dt_sec = float(drivor_cfg.get("plan_dt_sec", 0.5))
+    init_selection_state(agent)
 
 
 def run_step_rule_based(agent, ego_state):
@@ -1270,26 +1587,13 @@ def run_step_rule_based(agent, ego_state):
         output_num_poses=output_num_poses,
     )
 
-    try:
-        acc_cmd, steer_rate = traj_to_control(selected_plan, info)
-    except Exception:
-        LOG.exception("traj2control failed")
-        return brake_control()
-
-    agent._previous_selected_plan = selected_plan.copy()
-    agent._previous_selected_pose = agent._info_to_pose(info)
-    agent._previous_selected_score = selected_score_raw
-    agent._previous_selected_timestamp = float(info.get("timestamp", 0.0))
-    agent._previous_selected_source = selected_source
-
-    ctrl = carla.VehicleControl()
-    ctrl.steer = float(np.clip(steer_rate, -1.0, 1.0))
-    ctrl.throttle = float(np.clip(acc_cmd, 0.0, 1.0))
-    ctrl.brake = float(np.clip(-acc_cmd, 0.0, 1.0))
-    ctrl.hand_brake = False
-    ctrl.manual_gear_shift = False
-    agent._last_steer = ctrl.steer
-    return ctrl
+    # Route through the shared longitudinal controller so the rule planner gets
+    # the same dt-aware target-speed PID as DrivoR/RAP. ``agent._plan_dt_sec``
+    # is 0.25 s here (the rule planner's native dt), which is what fixes the
+    # 2x slowdown the old LQR-assumes-0.5 s path produced.
+    return apply_plan_control(
+        agent, selected_plan, info, selected_score_raw, selected_source
+    )
 
 def run_step_rap(agent, ego_state):
     import torch

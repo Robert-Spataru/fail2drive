@@ -21,6 +21,30 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 LOG = logging.getLogger(__name__)
 
+
+def _ensure_console_logging(level: int = logging.INFO) -> None:
+    """Attach an INFO ``StreamHandler`` to this module's logger exactly once.
+
+    The leaderboard client never calls ``logging.basicConfig``, so the root
+    logger stays at WARNING and ``LOG.info(...)`` from this module (including the
+    ``speed_diag`` line) gets swallowed. This wires a stdout handler directly on
+    our logger so those diagnostics actually print. Idempotent / import-safe.
+    """
+    if getattr(_ensure_console_logging, "_done", False):
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%H:%M:%S")
+    )
+    LOG.addHandler(handler)
+    LOG.setLevel(level)
+    LOG.propagate = False  # avoid double-printing if root later gets a handler
+    _ensure_console_logging._done = True
+
+
+_ensure_console_logging()
+
 _F2D_ROOT = Path(__file__).parent.parent.parent
 _AUTOAGENT0_ROOT = Path("/data/robert/AutoAgent0")
 
@@ -32,9 +56,8 @@ PRIVILEGED_AGENT_RADIUS_M = 50.0
 # (DrivoR/RAP) emit poses every 0.5 s; the rule planner emits every 0.25 s.
 # The actual per-planner value is stored on ``agent._plan_dt_sec`` at setup.
 PLAN_DT_SEC = 0.5
-# CARLA leaderboard runs the world at a fixed 20 Hz (see leaderboard_evaluator),
-# so one control step is 0.05 s. Used as a fallback when timestamps are missing.
-DEFAULT_CONTROL_DT_SEC = 0.05
+# Must match ``sim/ilqr/lqr.py`` ILQRSolverParameters.discretization_time.
+LQR_DISCRETIZATION_TIME = 0.5
 
 # HUGSIM-compatible camera names and CARLA ego mounts (meters, degrees).
 CAMERA_MOUNTS: Dict[str, Dict[str, float]] = {
@@ -76,8 +99,7 @@ TOPDOWN_EGO_COLOR_BGR = (255, 255, 255)
 # Line thickness for the top-down trajectory overlay. Candidates are drawn thin
 # and colored by rank (best=green -> worst=red); the selected plan is slightly
 # thicker so it stands out without obscuring the ranked candidates.
-TOPDOWN_CANDIDATE_THICKNESS = 1
-TOPDOWN_SELECTED_THICKNESS = 2
+TOPDOWN_LINE_THICKNESS = 1
 
 
 def navsim_proposal_to_hugsim_plan(trajectory: np.ndarray) -> np.ndarray:
@@ -229,7 +251,7 @@ def overlay_trajectories_on_topdown(
             [pts],
             isClosed=False,
             color=color,
-            thickness=TOPDOWN_CANDIDATE_THICKNESS,
+            thickness=TOPDOWN_LINE_THICKNESS,
             lineType=cv2.LINE_AA,
         )
         end_pt = (int(pts[-1][0]), int(pts[-1][1]))
@@ -257,7 +279,7 @@ def overlay_trajectories_on_topdown(
                 [pts],
                 isClosed=False,
                 color=TOPDOWN_SELECTED_COLOR_BGR,
-                thickness=TOPDOWN_SELECTED_THICKNESS,
+                thickness=TOPDOWN_LINE_THICKNESS,
                 lineType=cv2.LINE_AA,
             )
 
@@ -301,8 +323,7 @@ def save_predictions_frame(
         "selected_plan": np.asarray(
             viz_payload.get("selected_plan", []), dtype=np.float32
         ).tolist(),
-        # CARLA control actually applied this frame (throttle/brake/steer in
-        # [0,1]/[-1,1]), plus the PID target speed and measured ego speed (m/s).
+        # Commanded control + previous-tick pedals CARLA applied (applied_*).
         "control": getattr(agent, "_last_applied_control", None),
         "candidates": [
             {
@@ -607,7 +628,7 @@ def traj_to_control(plan_traj: np.ndarray, info: Dict[str, Any]):
 
 def build_vlm_selector_config_from_dict(vlm_dict: dict) -> "VLMSelectorConfig":
     # importing from AutoAgent0 repo
-    from autoagent0.decision.vlm_selector import VLMSelectorConfig
+    from autoagent0.scorer.vlm_selector import VLMSelectorConfig
     return VLMSelectorConfig(
         enabled=bool(vlm_dict.get("enabled", False)),
         intervention_enabled=bool(
@@ -716,7 +737,7 @@ def setup_rule_based(agent):
 
     # Import PrivilegedPlannerService exactly as client.py does
     try:
-        from privileged_planner.service import PrivilegedPlannerService
+        from privileged_planner_sd.service import PrivilegedPlannerService
     except ImportError as e:
         raise RuntimeError(
             f"PrivilegedPlannerService not found in {repo_root}. "
@@ -792,7 +813,7 @@ def setup_rule_based(agent):
         os.environ["PLANNER_VLM_PYTHON_BIN"] = os.environ[
             "RULE_BASED_VLM_PYTHON_BIN"
         ]
-        from autoagent0.decision.vlm_selector import VLMPlanSelector
+        from autoagent0.scorer.vlm_selector import VLMPlanSelector
         agent._vlm_selector = VLMPlanSelector(
             agent._vlm_selector_cfg, agent._output_dir
         )
@@ -809,12 +830,82 @@ def init_selection_state(agent) -> None:
     agent._previous_selected_score = None
     agent._previous_selected_timestamp = None
     agent._previous_selected_source = None
-    # Longitudinal PID state (reset per scenario/setup).
-    agent._lon_pid_integral = 0.0
-    agent._lon_pid_prev_error = 0.0
-    agent._previous_control_timestamp = None
-    agent._last_target_speed = None
     agent._last_applied_control = None
+    agent._last_ackermann_control = None
+    agent._previous_pedals = None
+    agent._ackermann_gear_initialized = False
+    agent._max_steer_rad = None
+
+def _control_cfg(agent) -> Dict[str, Any]:
+    """Control settings under ``carla.control`` (fallback: legacy ``carla.longitudinal``)."""
+    carla_cfg = getattr(agent, "_carla_cfg", {}) or {}
+    control = dict(carla_cfg.get("control", {}) or {})
+    if not control:
+        legacy = dict(carla_cfg.get("longitudinal", {}) or {})
+        if legacy:
+            mode = str(legacy.get("mode", "vehicle")).lower()
+            if mode in ("pid", "raw", "gain"):
+                mode = "vehicle"
+            control = {**legacy, "mode": mode}
+    return control
+
+
+def _control_mode(agent) -> str:
+    return str(_control_cfg(agent).get("mode", "vehicle")).lower()
+
+
+def _clear_ackermann_control(agent) -> None:
+    agent._last_ackermann_control = None
+
+
+def _get_max_steer_rad(agent, hero: carla.Vehicle) -> float:
+    cached = getattr(agent, "_max_steer_rad", None)
+    if cached is not None:
+        return float(cached)
+    try:
+        wheels = hero.get_physics_control().wheels
+        max_deg = max(float(w.max_steer_angle) for w in wheels) if wheels else 70.0
+    except Exception:
+        max_deg = 70.0
+    agent._max_steer_rad = math.radians(max_deg)
+    return float(agent._max_steer_rad)
+
+
+def _ensure_ackermann_gear(agent, hero: carla.Vehicle) -> None:
+    if getattr(agent, "_ackermann_gear_initialized", False):
+        return
+    gear_ctrl = carla.VehicleControl()
+    gear_ctrl.manual_gear_shift = True
+    gear_ctrl.gear = 1
+    hero.apply_control(gear_ctrl)
+    cfg = _control_cfg(agent)
+    settings = cfg.get("ackermann_settings")
+    if isinstance(settings, dict) and settings:
+        hero.apply_ackermann_controller_settings(
+            carla.AckermannControllerSettings(
+                speed_kp=float(settings.get("speed_kp", 0.15)),
+                speed_ki=float(settings.get("speed_ki", 0.0)),
+                speed_kd=float(settings.get("speed_kd", 0.25)),
+                accel_kp=float(settings.get("accel_kp", 0.01)),
+                accel_ki=float(settings.get("accel_ki", 0.0)),
+                accel_kd=float(settings.get("accel_kd", 0.01)),
+            )
+        )
+    agent._ackermann_gear_initialized = True
+
+
+def capture_previous_pedals(agent, hero: carla.Vehicle) -> None:
+    """Store pedals CARLA applied on the previous tick (for diagnostics)."""
+    try:
+        prev = hero.get_control()
+        agent._previous_pedals = {
+            "throttle": float(prev.throttle),
+            "brake": float(prev.brake),
+            "steer": float(prev.steer),
+        }
+    except Exception:
+        agent._previous_pedals = None
+
 
 def apply_rule_based_merge_env(
     rb_merge_dict: Optional[Dict[str, Any]],
@@ -889,7 +980,7 @@ def setup_vlm_selector(
         else:
             os.environ.pop("PLANNER_VLM_FORCE_CPU_OFFLOAD", None)
         from autoagent0.vlm.backends import set_vlm_subprocess_cuda_visible_devices
-        from autoagent0.decision.vlm_selector import VLMPlanSelector
+        from autoagent0.scorer.vlm_selector import VLMPlanSelector
 
         set_vlm_subprocess_cuda_visible_devices(
             resolve_vlm_subprocess_gpu_index(vlm_dict)
@@ -902,106 +993,46 @@ def setup_vlm_selector(
         agent._vlm_selector = None
         LOG.info("VLM disabled")
 
-# ----------------------------------------------------------------------------
-# Longitudinal control
-#
-# The LQR (``plan2control``) tracks the *position* of the reference path and
-# returns an acceleration command in m/s^2. The original code mapped that
-# straight onto CARLA's [0,1] throttle/brake pedals. That is wrong for two
-# reasons:
-#   1. m/s^2 != pedal fraction (a unit mismatch), and
-#   2. CARLA's Lincoln MKZ has real aerodynamic drag + rolling resistance, so
-#      holding a speed needs a *positive* throttle. When the planner is happy
-#      (acc_cmd ~ 0) the old mapping commanded throttle ~ 0, the car coasted
-#      down, and -- because the learned planners condition on ego speed -- it
-#      got stuck in a slow-creep equilibrium.
-# The fix: derive a *target speed* from the plan (using a lookahead so we don't
-# track the tiny front-loaded first step), then drive a speed PID with a drag
-# feed-forward term. The LQR is still used, but only for steering.
-# ----------------------------------------------------------------------------
-
-
-def _longitudinal_cfg(agent) -> Dict[str, Any]:
-    return dict((getattr(agent, "_carla_cfg", {}) or {}).get("longitudinal", {}) or {})
-
-
-def _control_dt_sec(agent, info: Dict[str, Any]) -> float:
-    """Wall-clock seconds since the previous control step (for PID timing)."""
-    now = float(info.get("timestamp", 0.0))
-    prev = getattr(agent, "_previous_control_timestamp", None)
-    agent._previous_control_timestamp = now
-    if prev is None:
-        return DEFAULT_CONTROL_DT_SEC
-    dt = now - prev
-    if not np.isfinite(dt) or dt <= 1e-3 or dt > 1.0:
-        return DEFAULT_CONTROL_DT_SEC
-    return float(dt)
-
-
-def _plan_target_speed(
-    plan: np.ndarray,
-    plan_dt: float,
-    *,
-    lookahead_time: float,
-    max_speed: float,
-) -> float:
-    """Estimate the plan's intended cruise speed (m/s).
-
-    ``plan`` is HUGSIM-local ``[x_right, y_forward]`` with waypoints ``plan_dt``
-    seconds apart. We compute per-segment speeds (including ego->first pose) and
-    take the **max** over a short lookahead window. Using the max (rather than
-    the first segment) avoids the front-loaded "accelerate later" trap where the
-    immediate step is near zero but the plan clearly intends to speed up.
-    """
+def _plan_step1_speed(plan: np.ndarray, plan_dt: float) -> float:
+    """Speed implied by the first plan waypoint (m/s), for logging only."""
     plan = np.asarray(plan, dtype=np.float32)
     if plan.ndim != 2 or len(plan) == 0 or plan_dt <= 0.0:
         return 0.0
-    pts = np.vstack([np.zeros((1, 2), dtype=np.float32), plan[:, :2]])
-    seg_dist = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-    seg_speed = seg_dist / float(plan_dt)
-    n_look = max(1, int(round(float(lookahead_time) / float(plan_dt))))
-    window = seg_speed[:n_look]
-    target = float(np.max(window)) if window.size else 0.0
-    return float(np.clip(target, 0.0, float(max_speed)))
+    return float(np.linalg.norm(plan[0, :2])) / float(plan_dt)
 
-def _longitudinal_pid(
+
+def _ackermann_speed_target(
     agent,
-    *,
-    target_speed: float,
-    current_speed: float,
-    control_dt: float,
+    info: Dict[str, Any],
+    acc_cmd: float,
+) -> float:
+    """Speed setpoint paired with LQR ``acc_cmd`` (m/s²) for Ackermann."""
+    cfg = _control_cfg(agent)
+    max_speed = float(cfg.get("max_speed", 20.1))
+    horizon = float(cfg.get("speed_horizon_sec", LQR_DISCRETIZATION_TIME))
+    ego_v = float(info.get("ego_velo", 0.0))
+    return float(np.clip(ego_v + float(acc_cmd) * horizon, 0.0, max_speed))
+
+
+def _lqr_to_ackermann_steer(
+    agent,
+    hero: carla.Vehicle,
+    info: Dict[str, Any],
+    steering_rate_cmd: float,
 ) -> Tuple[float, float]:
-    """Speed-tracking PID with a drag feed-forward term -> (throttle, brake)."""
-    lon = _longitudinal_cfg(agent)
-    kp = float(lon.get("kp", 0.4))
-    ki = float(lon.get("ki", 0.05))
-    kd = float(lon.get("kd", 0.0))
-    ff_gain = float(lon.get("feedforward_gain", 0.06))   # throttle per m/s to fight drag
-    ff_const = float(lon.get("feedforward_const", 0.0))  # static throttle offset
-    integral_clamp = float(lon.get("integral_clamp", 1.0))
-    brake_gain = float(lon.get("brake_gain", 1.0))
-    stop_speed = float(lon.get("stop_speed", 0.3))       # below this target -> brake
-    throttle_gain = float(lon.get("throttle_gain", 1.0)) # overall throttle scale
-
-    error = float(target_speed) - float(current_speed)
-
-    integral = float(getattr(agent, "_lon_pid_integral", 0.0)) + error * control_dt
-    integral = float(np.clip(integral, -integral_clamp, integral_clamp))
-    prev_error = float(getattr(agent, "_lon_pid_prev_error", error))
-    derivative = (error - prev_error) / control_dt if control_dt > 0 else 0.0
-    agent._lon_pid_integral = integral
-    agent._lon_pid_prev_error = error
-
-    feedforward = ff_const + ff_gain * float(target_speed) if target_speed > stop_speed else 0.0
-    command = kp * error + ki * integral + kd * derivative + feedforward
-
-    if target_speed <= stop_speed:
-        # Plan wants to (nearly) stop: brake proportionally to current speed.
-        return 0.0, float(np.clip(max(-command, 0.0) + 0.3, 0.0, 1.0))
-
-    if command >= 0.0:
-        return float(np.clip(command * throttle_gain, 0.0, 1.0)), 0.0
-    return 0.0, float(np.clip(-command * brake_gain, 0.0, 1.0))
+    """Map LQR steering-rate (rad/s) to Ackermann steer angle + steer speed."""
+    max_steer_rad = _get_max_steer_rad(agent, hero)
+    # ``info["ego_steer"]`` is CARLA normalized steer [-1, 1].
+    current_steer_rad = float(info.get("ego_steer", 0.0)) * max_steer_rad
+    rate = float(steering_rate_cmd)
+    horizon = float(
+        _control_cfg(agent).get("steer_horizon_sec", LQR_DISCRETIZATION_TIME)
+    )
+    target_steer = float(
+        np.clip(current_steer_rad + rate * horizon, -max_steer_rad, max_steer_rad)
+    )
+    steer_speed = abs(rate)
+    return target_steer, steer_speed
 
 
 def _log_speed_diagnostics(
@@ -1010,89 +1041,194 @@ def _log_speed_diagnostics(
     info: Dict[str, Any],
     source: str,
     *,
-    target_speed: float,
-    throttle: float,
-    brake: float,
+    acc_cmd: float,
+    plan_step1_speed: float,
+    control_mode: str,
+    throttle: Optional[float] = None,
+    brake: Optional[float] = None,
+    ack_speed: Optional[float] = None,
+    ack_accel: Optional[float] = None,
+    applied_throttle: Optional[float] = None,
+    applied_brake: Optional[float] = None,
 ) -> None:
+    if not coerce_bool(_control_cfg(agent).get("debug", True), default=True):
+        return
     try:
-        plan = np.asarray(plan, dtype=np.float32)
-        plan_dt = float(getattr(agent, "_plan_dt_sec", PLAN_DT_SEC))
         ego = float(info.get("ego_velo", 0.0))
-        first = float(np.linalg.norm(plan[0])) if len(plan) else 0.0
-        implied = first / plan_dt if plan_dt > 0 else 0.0
-        LOG.info(
-            "speed_diag src=%s ego=%.2f m/s (%.1f km/h) plan_step1=%.2f m/s "
-            "target=%.2f m/s thr=%.2f brk=%.2f",
-            source, ego, ego * 3.6, implied, float(target_speed), float(throttle), float(brake),
-        )
+        if control_mode == "ackermann":
+            LOG.info(
+                "speed_diag src=%s mode=ackermann ego=%.2f m/s (%.1f km/h) "
+                "plan_step1=%.2f m/s acc_cmd=%.3f ack_speed=%.2f ack_accel=%.3f "
+                "applied_thr=%s applied_brk=%s",
+                source, ego, ego * 3.6, float(plan_step1_speed), float(acc_cmd),
+                float(ack_speed) if ack_speed is not None else float("nan"),
+                float(ack_accel) if ack_accel is not None else float("nan"),
+                "None" if applied_throttle is None else f"{applied_throttle:.2f}",
+                "None" if applied_brake is None else f"{applied_brake:.2f}",
+            )
+        else:
+            LOG.info(
+                "speed_diag src=%s mode=vehicle ego=%.2f m/s (%.1f km/h) "
+                "plan_step1=%.2f m/s acc_cmd=%.3f thr=%.2f brk=%.2f "
+                "applied_thr=%s applied_brk=%s",
+                source, ego, ego * 3.6, float(plan_step1_speed), float(acc_cmd),
+                float(throttle or 0.0), float(brake or 0.0),
+                "None" if applied_throttle is None else f"{applied_throttle:.2f}",
+                "None" if applied_brake is None else f"{applied_brake:.2f}",
+            )
     except Exception:
         pass
 
 
-def _compute_throttle_brake(
+def _record_applied_control(
+    agent,
+    info: Dict[str, Any],
+    *,
+    control_mode: str,
+    acc_cmd: Optional[float] = None,
+    plan_step1_speed: Optional[float] = None,
+    vehicle_ctrl: Optional[carla.VehicleControl] = None,
+    ack_ctrl: Optional[carla.VehicleAckermannControl] = None,
+    steer_norm: Optional[float] = None,
+) -> None:
+    """Stash commanded control + previous-tick pedals for JSON diagnostics."""
+    prev = getattr(agent, "_previous_pedals", None) or {}
+    payload: Dict[str, Any] = {
+        "control_mode": control_mode,
+        "acc_cmd": float(acc_cmd) if acc_cmd is not None else None,
+        "plan_step1_speed": (
+            float(plan_step1_speed) if plan_step1_speed is not None else None
+        ),
+        "ego_velo": float(info.get("ego_velo", 0.0)),
+        "applied_throttle": prev.get("throttle"),
+        "applied_brake": prev.get("brake"),
+        "applied_steer": prev.get("steer"),
+    }
+    if vehicle_ctrl is not None:
+        payload.update({
+            "throttle": float(vehicle_ctrl.throttle),
+            "brake": float(vehicle_ctrl.brake),
+            "steer": float(vehicle_ctrl.steer),
+        })
+    if ack_ctrl is not None:
+        payload.update({
+            "ack_speed": float(ack_ctrl.speed),
+            "ack_acceleration": float(ack_ctrl.acceleration),
+            "ack_steer_rad": float(ack_ctrl.steer),
+            "ack_steer_speed": float(ack_ctrl.steer_speed),
+            "ack_jerk": float(ack_ctrl.jerk),
+            "steer": float(steer_norm) if steer_norm is not None else 0.0,
+            "throttle": None,
+            "brake": None,
+        })
+    agent._last_applied_control = payload
+
+
+def agent_brake_control(agent) -> carla.VehicleControl:
+    _clear_ackermann_control(agent)
+    return brake_control()
+
+
+def _apply_plan_control_vehicle(
     agent,
     selected_plan: np.ndarray,
     info: Dict[str, Any],
     acc_cmd: float,
+    steer_rate: float,
     selected_source: str,
-) -> Tuple[float, float]:
-    """Dispatch to the configured longitudinal controller.
+) -> carla.VehicleControl:
+    ctrl = carla.VehicleControl()
+    ctrl.steer = float(np.clip(steer_rate, -1.0, 1.0))
+    ctrl.throttle = float(np.clip(acc_cmd, 0.0, 1.0))
+    ctrl.brake = float(np.clip(-acc_cmd, 0.0, 1.0))
+    ctrl.hand_brake = False
+    ctrl.manual_gear_shift = False
+    agent._last_steer = ctrl.steer
+    _clear_ackermann_control(agent)
 
-    mode: "pid" (default) -> target-speed PID + drag feed-forward
-          "raw"           -> original acc_cmd-as-pedal behavior (vehicle moves slowly)
-    """
-    lon = _longitudinal_cfg(agent)
-    mode = str(lon.get("mode", "pid")).lower()
     plan_dt = float(getattr(agent, "_plan_dt_sec", PLAN_DT_SEC))
-
-    if mode == "raw":
-        throttle = float(np.clip(acc_cmd, 0.0, 1.0))
-        brake = float(np.clip(-acc_cmd, 0.0, 1.0))
-        target_speed = float("nan")
-    else:  # "pid"
-        max_speed = float(lon.get("max_speed", 20.1))  # ~45 mph
-        lookahead_time = float(lon.get("lookahead_time", 2.0))
-        target_speed = _plan_target_speed(
-            selected_plan, plan_dt,
-            lookahead_time=lookahead_time, max_speed=max_speed,
-        )
-        throttle, brake = _longitudinal_pid(
-            agent,
-            target_speed=target_speed,
-            current_speed=float(info.get("ego_velo", 0.0)),
-            control_dt=_control_dt_sec(agent, info),
-        )
-
-    agent._last_target_speed = target_speed
-
-    if coerce_bool(lon.get("debug", True), default=True):
-        _log_speed_diagnostics(
-            agent, selected_plan, info, selected_source,
-            target_speed=target_speed, throttle=throttle, brake=brake,
-        )
-    return throttle, brake
+    plan_step1_speed = _plan_step1_speed(selected_plan, plan_dt)
+    prev = getattr(agent, "_previous_pedals", None) or {}
+    _log_speed_diagnostics(
+        agent, selected_plan, info, selected_source,
+        acc_cmd=float(acc_cmd),
+        plan_step1_speed=plan_step1_speed,
+        control_mode="vehicle",
+        throttle=float(ctrl.throttle),
+        brake=float(ctrl.brake),
+        applied_throttle=prev.get("throttle"),
+        applied_brake=prev.get("brake"),
+    )
+    _record_applied_control(
+        agent, info,
+        control_mode="vehicle",
+        acc_cmd=float(acc_cmd),
+        plan_step1_speed=plan_step1_speed,
+        vehicle_ctrl=ctrl,
+    )
+    return ctrl
 
 
-def _record_applied_control(
+def _apply_plan_control_ackermann(
     agent,
-    ctrl: carla.VehicleControl,
+    selected_plan: np.ndarray,
     info: Dict[str, Any],
-    *,
-    target_speed: Optional[float] = None,
-) -> None:
-    """Stash the control actually sent to CARLA so it can be saved per frame."""
-    ts: Optional[float]
-    if target_speed is None or not np.isfinite(target_speed):
-        ts = None
-    else:
-        ts = float(target_speed)
-    agent._last_applied_control = {
-        "throttle": float(ctrl.throttle),
-        "brake": float(ctrl.brake),
-        "steer": float(ctrl.steer),
-        "target_speed": ts,
-        "ego_velo": float(info.get("ego_velo", 0.0)),
-    }
+    acc_cmd: float,
+    steering_rate_cmd: float,
+    selected_source: str,
+) -> carla.VehicleControl:
+    hero = find_hero(agent)
+    if hero is None:
+        raise RuntimeError("hero vehicle not found for Ackermann control")
+
+    _ensure_ackermann_gear(agent, hero)
+    target_speed = _ackermann_speed_target(agent, info, acc_cmd)
+    target_steer, steer_speed = _lqr_to_ackermann_steer(
+        agent, hero, info, steering_rate_cmd,
+    )
+    max_steer_rad = _get_max_steer_rad(agent, hero)
+    steer_norm = float(np.clip(target_steer / max_steer_rad, -1.0, 1.0))
+
+    ack = carla.VehicleAckermannControl(
+        steer=target_steer,
+        steer_speed=steer_speed,
+        speed=float(target_speed),
+        acceleration=float(acc_cmd),
+        jerk=0.0,
+    )
+    agent._last_ackermann_control = ack
+
+    # VehicleControl for blackboard / leaderboard stats only.
+    ctrl = carla.VehicleControl()
+    ctrl.steer = steer_norm
+    ctrl.throttle = 0.0
+    ctrl.brake = 0.0
+    ctrl.hand_brake = False
+    ctrl.manual_gear_shift = False
+    agent._last_steer = ctrl.steer
+
+    plan_dt = float(getattr(agent, "_plan_dt_sec", PLAN_DT_SEC))
+    plan_step1_speed = _plan_step1_speed(selected_plan, plan_dt)
+    prev = getattr(agent, "_previous_pedals", None) or {}
+    _log_speed_diagnostics(
+        agent, selected_plan, info, selected_source,
+        acc_cmd=float(acc_cmd),
+        plan_step1_speed=plan_step1_speed,
+        control_mode="ackermann",
+        ack_speed=float(ack.speed),
+        ack_accel=float(ack.acceleration),
+        applied_throttle=prev.get("throttle"),
+        applied_brake=prev.get("brake"),
+    )
+    _record_applied_control(
+        agent, info,
+        control_mode="ackermann",
+        acc_cmd=float(acc_cmd),
+        plan_step1_speed=plan_step1_speed,
+        ack_ctrl=ack,
+        steer_norm=steer_norm,
+    )
+    return ctrl
 
 
 def apply_plan_control(
@@ -1103,15 +1239,15 @@ def apply_plan_control(
     selected_source: str,
 ) -> carla.VehicleControl:
     if selected_plan is None or len(selected_plan) == 0:
-        fallback = brake_control()
-        _record_applied_control(agent, fallback, info)
+        fallback = agent_brake_control(agent)
+        _record_applied_control(agent, info, control_mode="vehicle", vehicle_ctrl=fallback)
         return fallback
     try:
         acc_cmd, steer_rate = traj_to_control(selected_plan, info)
     except Exception:
         LOG.exception("traj2control failed")
-        fallback = brake_control()
-        _record_applied_control(agent, fallback, info)
+        fallback = agent_brake_control(agent)
+        _record_applied_control(agent, info, control_mode="vehicle", vehicle_ctrl=fallback)
         return fallback
 
     agent._previous_selected_plan = np.asarray(
@@ -1122,22 +1258,19 @@ def apply_plan_control(
     agent._previous_selected_timestamp = float(info.get("timestamp", 0.0))
     agent._previous_selected_source = selected_source
 
-    throttle, brake = _compute_throttle_brake(
-        agent, selected_plan, info, float(acc_cmd), selected_source
-    )
+    acc_cmd_f = float(acc_cmd)
+    if _control_mode(agent) == "ackermann":
+        try:
+            return _apply_plan_control_ackermann(
+                agent, selected_plan, info, acc_cmd_f, float(steer_rate), selected_source,
+            )
+        except Exception:
+            LOG.exception("Ackermann control failed; falling back to VehicleControl")
+            _clear_ackermann_control(agent)
 
-    ctrl = carla.VehicleControl()
-    # Steering still comes from the LQR (lateral tracking unchanged).
-    ctrl.steer = float(np.clip(steer_rate, -1.0, 1.0))
-    ctrl.throttle = throttle
-    ctrl.brake = brake
-    ctrl.hand_brake = False
-    ctrl.manual_gear_shift = False
-    agent._last_steer = ctrl.steer
-    _record_applied_control(
-        agent, ctrl, info, target_speed=getattr(agent, "_last_target_speed", None)
+    return _apply_plan_control_vehicle(
+        agent, selected_plan, info, acc_cmd_f, float(steer_rate), selected_source,
     )
-    return ctrl
 
 def export_rap_env(rap_cfg: Dict[str, Any]) -> None:
     os.environ["RAP_REPO_ROOT"] = str(rap_cfg["repo_root"])
@@ -1207,19 +1340,12 @@ def create_learned_planner_selector(
     strict_learned_argmax_lookup: bool,
     q_key_prefix: bool,
 ) -> Any:
-    from autoagent0.agent.runtime import AutoAgent0Runtime
     from autoagent0.config import resolve_autoagent0_config
-    from autoagent0.decision.planner_selection import LearnedPlannerSelector
-
-    if not hasattr(agent, "_autoagent0_runtime") or agent._autoagent0_runtime is None:
-        agent._autoagent0_runtime = AutoAgent0Runtime(
-            runtime_name=planner_log_name.lower(),
-            logger=LOG,
-        )
+    from autoagent0.scorer.planner_selection import LearnedPlannerSelector
 
     return LearnedPlannerSelector(
         vlm_selector=agent._vlm_selector,
-        autoagent0_runtime=agent._autoagent0_runtime,
+        runtime_name=planner_log_name.lower(),
         autoagent0_cfg=resolve_autoagent0_config(),
         vlm_cfg=agent._vlm_selector_cfg,
         rule_based_merge_cfg=rule_based_merge_cfg,
@@ -1467,6 +1593,27 @@ def setup_drivor(agent):
     init_selection_state(agent)
 
 
+def _rule_based_plain_plan(
+    rb,
+    proposals: np.ndarray,
+    scores: np.ndarray,
+    output_num_poses: int,
+) -> Tuple[np.ndarray, float]:
+    """Plain argmax selection: highest-scoring proposal -> HUGSIM plan.
+
+    Replaces the old ``rb.build_plain_rule_based_plan_result`` (removed when the
+    AutoAgent0 rule-based adapter was split into pure-inference + provider).
+    """
+    scores_arr = np.asarray(scores, dtype=np.float32)
+    best_idx = int(np.argmax(scores_arr)) if scores_arr.size else 0
+    selected_plan = np.asarray(
+        rb.rule_based_to_hugsim_plan(proposals[best_idx, :output_num_poses]),
+        dtype=np.float32,
+    )
+    selected_score_raw = float(scores_arr[best_idx]) if scores_arr.size else 0.0
+    return selected_plan, selected_score_raw
+
+
 def run_step_rule_based(agent, ego_state):
 
     obs = ego_state["obs"]
@@ -1483,11 +1630,11 @@ def run_step_rule_based(agent, ego_state):
         )
     except Exception:
         LOG.exception("Rule-based planner.process() failed")
-        return brake_control()
+        return agent_brake_control(agent)
 
     if not selected:
         LOG.warning("Rule-based planner returned no trajectories")
-        return brake_control()
+        return agent_brake_control(agent)
 
     rb = agent._rb_client
     output_num_poses = agent._rule_based_output_num_poses
@@ -1497,7 +1644,7 @@ def run_step_rule_based(agent, ego_state):
         scores = rb.trajectory_to_scores(selected, planner_debug)
     except Exception:
         LOG.exception("Failed to convert rule-based trajectories")
-        return brake_control()
+        return agent_brake_control(agent)
 
     vlm_cfg = agent._vlm_selector_cfg
     selected_plan = None
@@ -1505,29 +1652,22 @@ def run_step_rule_based(agent, ego_state):
     selected_source = "rule_based_argmax"
 
     if not vlm_cfg.enabled:
-        plain_result = rb.build_plain_rule_based_plan_result(
-            proposals, scores, output_num_poses
-        )
-        selected_plan = np.asarray(
-            plain_result["selected_plan"], dtype=np.float32
-        )
-        selected_score_raw = float(
-            plain_result.get("selected_score_raw", plain_result["selected_score"])
+        selected_plan, selected_score_raw = _rule_based_plain_plan(
+            rb, proposals, scores, output_num_poses
         )
         selected_source = "rule_based_argmax"
     else:
         try:
-            candidate_rows, _allow_carry_prev = rb.build_rule_based_candidate_rows(
-                proposals=proposals,
-                scores=scores,
+            from autoagent0.experts.rule_based_provider import (
+                build_rule_based_candidate_rows,
+            )
+
+            candidate_rows = build_rule_based_candidate_rows(
+                proposals,
+                scores,
                 output_num_poses=output_num_poses,
-                vlm_cfg=vlm_cfg,
-                current_info=info,
-                previous_selected_plan=agent._previous_selected_plan,
-                previous_selected_pose=agent._previous_selected_pose,
-                previous_selected_score=agent._previous_selected_score,
-                previous_selected_timestamp=agent._previous_selected_timestamp,
-                previous_selected_source=agent._previous_selected_source,
+                source_name="rule_based_argmax",
+                topk=RULE_BASED_TOPK,
             )
             scores_arr = np.asarray(scores, dtype=np.float32)
             best_idx = int(np.argmax(scores_arr))
@@ -1564,19 +1704,13 @@ def run_step_rule_based(agent, ego_state):
             )
         except Exception:
             LOG.exception("VLM selection failed; falling back to argmax")
-            plain_result = rb.build_plain_rule_based_plan_result(
-                proposals, scores, output_num_poses
-            )
-            selected_plan = np.asarray(
-                plain_result["selected_plan"], dtype=np.float32
-            )
-            selected_score_raw = float(
-                plain_result.get("selected_score_raw", plain_result["selected_score"])
+            selected_plan, selected_score_raw = _rule_based_plain_plan(
+                rb, proposals, scores, output_num_poses
             )
             selected_source = "rule_based_argmax_fallback"
 
     if selected_plan is None or len(selected_plan) == 0:
-        return brake_control()
+        return agent_brake_control(agent)
 
     agent._step_viz = build_step_viz_payload(
         selected_plan=selected_plan,
@@ -1587,10 +1721,7 @@ def run_step_rule_based(agent, ego_state):
         output_num_poses=output_num_poses,
     )
 
-    # Route through the shared longitudinal controller so the rule planner gets
-    # the same dt-aware target-speed PID as DrivoR/RAP. ``agent._plan_dt_sec``
-    # is 0.25 s here (the rule planner's native dt), which is what fixes the
-    # 2x slowdown the old LQR-assumes-0.5 s path produced.
+    # Shared LQR -> CARLA VehicleControl path (acc_cmd as throttle/brake).
     return apply_plan_control(
         agent, selected_plan, info, selected_score_raw, selected_source
     )
@@ -1606,7 +1737,7 @@ def run_step_rap(agent, ego_state):
     for cam_name in cfg.camera_order:
         if cam_name not in obs.get("rgb", {}):
             LOG.warning("Missing camera %s for RAP inference", cam_name)
-            return brake_control()
+            return agent_brake_control(agent)
 
     privileged_agents = None
     if (
@@ -1625,7 +1756,7 @@ def run_step_rap(agent, ego_state):
             proposals = predictions["trajectory"][0].detach().cpu().numpy()
     except Exception:
         LOG.exception("RAP inference failed")
-        return brake_control()
+        return agent_brake_control(agent)
 
     proposals_hugsim = np.stack(
         [
@@ -1648,7 +1779,7 @@ def run_step_rap(agent, ego_state):
         )
     except Exception:
         LOG.exception("RAP plan selection failed")
-        return brake_control()
+        return agent_brake_control(agent)
 
     agent._step_viz = build_step_viz_payload(
         selected_plan=selected_plan,
@@ -1674,7 +1805,7 @@ def run_step_drivor(agent, ego_state):
     for cam_name in drivor.MAP_HUGSIM_TO_DRIVOR:
         if cam_name not in obs.get("rgb", {}):
             LOG.warning("Missing camera %s for DrivoR inference", cam_name)
-            return brake_control()
+            return agent_brake_control(agent)
 
     privileged_agents = None
     if (
@@ -1714,7 +1845,7 @@ def run_step_drivor(agent, ego_state):
         )
     except Exception:
         LOG.exception("DrivoR inference failed")
-        return brake_control()
+        return agent_brake_control(agent)
 
     proposals_hugsim = np.stack(
         [
@@ -1737,7 +1868,7 @@ def run_step_drivor(agent, ego_state):
         )
     except Exception:
         LOG.exception("DrivoR plan selection failed")
-        return brake_control()
+        return agent_brake_control(agent)
 
     agent._step_viz = build_step_viz_payload(
         selected_plan=selected_plan,
@@ -1934,7 +2065,9 @@ def brake_control() -> carla.VehicleControl:
     ctrl.brake = 1.0
     return ctrl
 
+
 def get_ego_state(agent, hero, input_data, timestamp):
+    capture_previous_pedals(agent, hero)
     transform = hero.get_transform()
     velocity = hero.get_velocity()
     speed_mps = math.sqrt(

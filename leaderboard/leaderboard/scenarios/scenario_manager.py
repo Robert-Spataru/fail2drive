@@ -190,7 +190,16 @@ class ScenarioManager(object):
                 raise AgentError(e)
 
             self._watchdog.resume()
-            self.ego_vehicles[0].apply_control(ego_action)
+            agent_obj = getattr(self._agent_wrapper, "_agent", None)
+            ack = (
+                getattr(agent_obj, "_last_ackermann_control", None)
+                if agent_obj is not None
+                else None
+            )
+            if ack is not None:
+                self.ego_vehicles[0].apply_ackermann_control(ack)
+            else:
+                self.ego_vehicles[0].apply_control(ego_action)
 
             # Tick scenario. Add the ego control to the blackboard in case some behaviors want to change it
             py_trees.blackboard.Blackboard().set("AV_control", ego_action, overwrite=True)

@@ -14,24 +14,13 @@ carla:
   scenarios_dir_name: scenarios
   camera_rig: 4cam
   predictions_dir: predictions
-  # Longitudinal (throttle/brake) controller. The LQR is used only for steering;
-  # throttle/brake come from a speed PID that tracks a target speed read from the
-  # plan, with a feed-forward term to overcome CARLA's drag. The rule planner's
-  # native 0.25 s pose spacing is handled automatically (agent._plan_dt_sec).
-  longitudinal:
-    mode: pid             # pid | raw
-    max_speed: 20.1       # m/s cap on target speed (~45 mph)
-    lookahead_time: 2.0   # s; window used to read the plan's intended cruise speed
-    kp: 0.4
-    ki: 0.05
-    kd: 0.0
-    feedforward_gain: 0.06  # throttle per m/s to hold speed against drag
-    feedforward_const: 0.0
-    integral_clamp: 1.0
-    stop_speed: 0.3       # target below this -> brake
-    throttle_gain: 1.0    # overall throttle scale (also used by mode: gain)
-    brake_gain: 1.0
-    debug: true           # log per-step speed diagnostics
+  # control.mode: vehicle (8fe6a4f baseline) | ackermann (LQR acc_cmd -> m/s²)
+  control:
+    mode: ackermann
+    max_speed: 20.1
+    speed_horizon_sec: 0.5   # matches LQR discretization_time
+    steer_horizon_sec: 0.5
+    debug: true
   topdown_camera:
     width: 800
     height: 800
@@ -47,4 +36,3 @@ carla:
     save_grid_video: false
     save_topdown_video: true
     fps: 20
- 

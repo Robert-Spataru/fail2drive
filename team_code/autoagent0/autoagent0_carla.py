@@ -22,7 +22,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from autoagent0_carla_helper import (
     EGO_HISTORY_FRAMES,
-    brake_control,
+    agent_brake_control,
     finalize_recording,
     find_hero,
     get_ego_state,
@@ -36,6 +36,8 @@ from autoagent0_carla_helper import (
     setup_rap,
     setup_rule_based,
     resolve_scenario_output_dir,
+    _control_cfg,
+    _control_mode,
 )
 
 LOG = logging.getLogger(__name__)
@@ -101,6 +103,12 @@ class AutoAgent0CarlaAgent(AutonomousAgent):
                 f"Invalid planner type: {self._planner_type}"
             )
 
+        LOG.info(
+            "AutoAgent0: control mode=%s cfg=%s",
+            _control_mode(self),
+            _control_cfg(self),
+        )
+
         setup_cameras_and_recording(self)
 
     def sensors(self):
@@ -131,7 +139,7 @@ class AutoAgent0CarlaAgent(AutonomousAgent):
     def run_step(self, input_data, timestamp):
         hero = find_hero(self)
         if hero is None:
-            return brake_control()
+            return agent_brake_control(self)
 
         ego_state = get_ego_state(self, hero, input_data, timestamp)
         self._info_history.append(ego_state["info"])

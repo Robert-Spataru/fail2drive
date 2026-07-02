@@ -96,10 +96,12 @@ TOPDOWN_VIZ_TOPK = 5
 TOPDOWN_SELECTED_COLOR_BGR = (80, 255, 80)
 TOPDOWN_CANDIDATE_COLOR_BGR = (200, 200, 200)
 TOPDOWN_EGO_COLOR_BGR = (255, 255, 255)
-# Line thickness for the top-down trajectory overlay. Candidates are drawn thin
-# and colored by rank (best=green -> worst=red); the selected plan is slightly
-# thicker so it stands out without obscuring the ranked candidates.
+# Uniform line thickness for trajectory overlays (top-down and front-view).
 TOPDOWN_LINE_THICKNESS = 1
+FRONT_CAM_ID = "CAM_FRONT"
+FRONT_LINE_THICKNESS = TOPDOWN_LINE_THICKNESS
+PLAN_VIS_FORWARD_OFFSET_M = 4.5
+PLAN_RESAMPLE_SPACING_M = 0.08
 
 
 def navsim_proposal_to_hugsim_plan(trajectory: np.ndarray) -> np.ndarray:
@@ -305,6 +307,319 @@ def overlay_trajectories_on_topdown(
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def _fov2focal(fov: float, pixels: float) -> float:
+    return pixels / (2.0 * math.tan(fov / 2.0))
+
+
+def _get_camera_matrix(intrinsic: Dict[str, float]) -> np.ndarray:
+    k = np.eye(4, dtype=np.float32)
+    k[0, 0] = _fov2focal(intrinsic["fovx"], intrinsic["W"])
+    k[1, 1] = _fov2focal(intrinsic["fovy"], intrinsic["H"])
+    k[0, 2] = intrinsic["cx"]
+    k[1, 2] = intrinsic["cy"]
+    return k
+
+
+def _euler_xyz_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float32
+    )
+    ry = np.array(
+        [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32
+    )
+    rz = np.array(
+        [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+    )
+    return (rz @ ry @ rx).astype(np.float32)
+
+
+def _rt2pose(rot_rad: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = _euler_xyz_to_matrix(
+        float(rot_rad[0]), float(rot_rad[1]), float(rot_rad[2])
+    )
+    pose[:3, 3] = np.asarray(pos, dtype=np.float32)
+    return pose
+
+
+def _get_camera_c2w(
+    cam_params: Dict[str, Dict[str, np.ndarray]],
+    ego_pose: np.ndarray,
+    cam_name: str,
+) -> np.ndarray:
+    params = cam_params[cam_name]
+    if "front2cam" in params:
+        return ego_pose @ np.asarray(params["front2cam"], dtype=np.float32)
+
+    v2front = np.asarray(cam_params[FRONT_CAM_ID]["v2c"], dtype=np.float32)
+    v2c = np.asarray(params["v2c"], dtype=np.float32)
+    c2front = v2front @ np.linalg.inv(v2c)
+    return ego_pose @ c2front
+
+
+def _local_plan_to_front_world(
+    plan_traj: np.ndarray,
+    front_c2w: np.ndarray,
+    front_v2c: np.ndarray,
+) -> np.ndarray:
+    plan_traj = np.asarray(plan_traj, dtype=np.float32)
+    if len(plan_traj) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    local_xyz = np.zeros((len(plan_traj) + 1, 3), dtype=np.float32)
+    local_xyz[1:, :2] = plan_traj
+    local_xyz[:, 1] += float(PLAN_VIS_FORWARD_OFFSET_M)
+
+    camera_in_vehicle = np.linalg.inv(np.asarray(front_v2c, dtype=np.float32))[:3, 3]
+    camera_in_local = np.array(
+        [-camera_in_vehicle[1], camera_in_vehicle[0], camera_in_vehicle[2]],
+        dtype=np.float32,
+    )
+    local_to_front_cam = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    points_cam = (local_to_front_cam @ (local_xyz - camera_in_local).T).T
+    homogeneous = np.concatenate(
+        [points_cam, np.ones((len(points_cam), 1), dtype=np.float32)],
+        axis=1,
+    )
+    return (np.asarray(front_c2w, dtype=np.float32) @ homogeneous.T).T[:, :3].astype(
+        np.float32
+    )
+
+
+def _resample_polyline(
+    points_world: np.ndarray,
+    spacing: float = PLAN_RESAMPLE_SPACING_M,
+) -> np.ndarray:
+    points_world = np.asarray(points_world, dtype=np.float32)
+    if len(points_world) < 2:
+        return points_world
+
+    segment_lengths = np.linalg.norm(
+        np.diff(points_world[:, [0, 2]], axis=0), axis=1
+    )
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total_length = cumulative[-1]
+    if total_length < 1e-4:
+        return points_world[:1]
+
+    sample_distances = np.arange(0.0, total_length + spacing, spacing, dtype=np.float32)
+    sample_distances[-1] = min(sample_distances[-1], total_length)
+
+    resampled = []
+    seg_idx = 0
+    for dist in sample_distances:
+        while seg_idx + 1 < len(cumulative) and cumulative[seg_idx + 1] < dist:
+            seg_idx += 1
+        if seg_idx + 1 >= len(points_world):
+            resampled.append(points_world[-1])
+            continue
+        seg_start = cumulative[seg_idx]
+        seg_end = cumulative[seg_idx + 1]
+        denom = max(seg_end - seg_start, 1e-6)
+        alpha = float((dist - seg_start) / denom)
+        point = (1.0 - alpha) * points_world[seg_idx] + alpha * points_world[
+            seg_idx + 1
+        ]
+        resampled.append(point)
+    return np.asarray(resampled, dtype=np.float32)
+
+
+def _draw_projected_polyline_camera_clipped(
+    image: np.ndarray,
+    points_world: np.ndarray,
+    intrinsic: Dict[str, float],
+    c2w: np.ndarray,
+    color: Tuple[int, int, int],
+    thickness: int = FRONT_LINE_THICKNESS,
+    near: float = 1e-3,
+) -> np.ndarray:
+    points_world = np.asarray(points_world, dtype=np.float32)
+    if len(points_world) < 2:
+        return image
+
+    k = _get_camera_matrix(intrinsic)[:3, :3]
+    w2c = np.linalg.inv(np.asarray(c2w, dtype=np.float32))
+    homogeneous = np.concatenate(
+        [points_world, np.ones((len(points_world), 1), dtype=np.float32)],
+        axis=1,
+    )
+    camera_points = (w2c @ homogeneous.T).T[:, :3]
+
+    h, w = image.shape[:2]
+    rect = (0, 0, w, h)
+
+    def project_point(point_cam: np.ndarray) -> Tuple[int, int]:
+        projected = k @ point_cam
+        uv = projected[:2] / np.clip(projected[2], near, None)
+        return tuple(np.round(uv).astype(np.int32))
+
+    for p0, p1 in zip(camera_points[:-1], camera_points[1:]):
+        z0, z1 = float(p0[2]), float(p1[2])
+        if z0 <= near and z1 <= near:
+            continue
+
+        q0 = p0.copy()
+        q1 = p1.copy()
+        if z0 <= near:
+            alpha = (near - z0) / max(z1 - z0, 1e-6)
+            q0 = p0 + alpha * (p1 - p0)
+            q0[2] = near
+        if z1 <= near:
+            alpha = (near - z1) / max(z0 - z1, 1e-6)
+            q1 = p1 + alpha * (p0 - p1)
+            q1[2] = near
+
+        pixel0 = project_point(q0)
+        pixel1 = project_point(q1)
+        ok, clipped_p0, clipped_p1 = cv2.clipLine(rect, pixel0, pixel1)
+        if not ok:
+            continue
+        cv2.line(
+            image,
+            clipped_p0,
+            clipped_p1,
+            color=color,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+    return image
+
+
+def _project_world_points_to_image(
+    points_world: np.ndarray,
+    intrinsic: Dict[str, float],
+    c2w: np.ndarray,
+) -> List[Tuple[int, int, bool]]:
+    if len(points_world) == 0:
+        return []
+
+    k = _get_camera_matrix(intrinsic)
+    homogeneous = np.concatenate(
+        [
+            np.asarray(points_world, dtype=np.float32),
+            np.ones((len(points_world), 1), dtype=np.float32),
+        ],
+        axis=1,
+    )
+    camera_points = (np.linalg.inv(c2w) @ homogeneous.T).T[:, :3]
+
+    depth = camera_points[:, 2]
+    valid = depth > 1e-4
+    points: List[Tuple[int, int, bool]] = []
+    for idx, point_cam in enumerate(camera_points):
+        if not valid[idx]:
+            points.append((0, 0, False))
+            continue
+        image_point = k[:3, :3] @ point_cam
+        uv = image_point[:2] / np.clip(image_point[2], 1e-3, None)
+        points.append(
+            (int(round(float(uv[0]))), int(round(float(uv[1]))), True)
+        )
+    return points
+
+
+def overlay_trajectories_on_front(
+    image_rgb: np.ndarray,
+    viz_payload: Dict[str, Any],
+    *,
+    info: Dict[str, Any],
+    cam_name: str = FRONT_CAM_ID,
+) -> np.ndarray:
+    img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    cam_params = info.get("cam_params") or {}
+    if cam_name not in cam_params:
+        return image_rgb
+
+    ego_pose = _rt2pose(
+        np.asarray(info["ego_rot"], dtype=np.float32),
+        np.asarray(info["ego_pos"], dtype=np.float32),
+    )
+    intrinsic = cam_params[cam_name]["intrinsic"]
+    camera_c2w = _get_camera_c2w(cam_params, ego_pose, cam_name)
+    camera_v2c = cam_params[cam_name]["v2c"]
+    h, w = img.shape[:2]
+
+    candidate_plans = viz_payload.get("candidate_plans", [])
+    num_ranks = len(candidate_plans)
+    for rank_idx, plan in enumerate(candidate_plans):
+        plan_world = _local_plan_to_front_world(plan, camera_c2w, camera_v2c)
+        plan_world_dense = _resample_polyline(plan_world)
+        if len(plan_world_dense) < 2:
+            continue
+        color = _rank_color_bgr(rank_idx, num_ranks)
+        _draw_projected_polyline_camera_clipped(
+            img,
+            plan_world_dense,
+            intrinsic,
+            camera_c2w,
+            color=color,
+            thickness=FRONT_LINE_THICKNESS,
+        )
+        pixels = _project_world_points_to_image(
+            plan_world_dense, intrinsic, camera_c2w
+        )
+        label_anchor = None
+        for px, py, valid in reversed(pixels):
+            if valid and 0 <= px < w and 0 <= py < h:
+                label_anchor = (int(px), int(py))
+                break
+        if label_anchor is not None:
+            cv2.putText(
+                img,
+                str(rank_idx + 1),
+                (label_anchor[0] + 4, label_anchor[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    selected_plan = viz_payload.get("selected_plan")
+    if selected_plan is not None and len(selected_plan) > 0:
+        plan_world = _local_plan_to_front_world(
+            selected_plan, camera_c2w, camera_v2c
+        )
+        plan_world_dense = _resample_polyline(plan_world)
+        if len(plan_world_dense) >= 2:
+            _draw_projected_polyline_camera_clipped(
+                img,
+                plan_world_dense,
+                intrinsic,
+                camera_c2w,
+                color=TOPDOWN_SELECTED_COLOR_BGR,
+                thickness=FRONT_LINE_THICKNESS,
+            )
+
+    label = str(viz_payload.get("selected_source", ""))
+    score = viz_payload.get("selected_score")
+    if score is not None:
+        label = f"{label} ({float(score):.2f})"
+    if label:
+        cv2.putText(
+            img,
+            label,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            TOPDOWN_SELECTED_COLOR_BGR,
+            2,
+            cv2.LINE_AA,
+        )
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def save_predictions_frame(
     agent,
     frame_idx: int,
@@ -351,24 +666,32 @@ def record_post_step_visualization(agent, ego_state: Dict[str, Any]) -> None:
     frame_idx = agent._frame_index
     save_predictions_frame(agent, frame_idx, viz_payload, info)
 
-    if not getattr(agent, "_recording_save_topdown_video", False):
-        return
+    if getattr(agent, "_recording_save_topdown_video", False):
+        topdown_rgb = ego_state.get("topdown_rgb")
+        if topdown_rgb is None:
+            spec = getattr(agent, "_topdown_camera_spec", None) or {}
+            width = int(spec.get("width", 800))
+            height = int(spec.get("height", width))
+            topdown_rgb = np.full((height, width, 3), 32, dtype=np.uint8)
 
-    topdown_rgb = ego_state.get("topdown_rgb")
-    if topdown_rgb is None:
-        spec = getattr(agent, "_topdown_camera_spec", None) or {}
-        width = int(spec.get("width", 800))
-        height = int(spec.get("height", width))
-        topdown_rgb = np.full((height, width, 3), 32, dtype=np.uint8)
+        topdown_overlay = overlay_trajectories_on_topdown(
+            topdown_rgb,
+            viz_payload,
+            pixels_per_meter=float(
+                getattr(agent, "_topdown_pixels_per_meter", 10.0)
+            ),
+        )
+        agent._topdown_video_buffer.append(topdown_overlay)
 
-    overlay = overlay_trajectories_on_topdown(
-        topdown_rgb,
-        viz_payload,
-        pixels_per_meter=float(
-            getattr(agent, "_topdown_pixels_per_meter", 10.0)
-        ),
-    )
-    agent._topdown_video_buffer.append(overlay)
+    if getattr(agent, "_recording_save_front_video", False):
+        front_rgb = ego_state.get("front_rgb")
+        if front_rgb is not None:
+            front_overlay = overlay_trajectories_on_front(
+                front_rgb,
+                viz_payload,
+                info=info,
+            )
+            agent._front_video_buffer.append(front_overlay)
 
 
 
@@ -622,7 +945,7 @@ def traj_to_control(plan_traj: np.ndarray, info: Dict[str, Any]):
     curr_stat = np.array(
         [0.0, 0.0, 0.0, info["ego_velo"], info["ego_steer"]]
     )
-    return plan2control(plan_traj_stats, curr_stat)
+    return plan2control(plan_traj_stats, curr_stat, "CARLA")
 
 
 
@@ -879,18 +1202,17 @@ def _ensure_ackermann_gear(agent, hero: carla.Vehicle) -> None:
     gear_ctrl.gear = 1
     hero.apply_control(gear_ctrl)
     cfg = _control_cfg(agent)
-    settings = cfg.get("ackermann_settings")
-    if isinstance(settings, dict) and settings:
-        hero.apply_ackermann_controller_settings(
-            carla.AckermannControllerSettings(
-                speed_kp=float(settings.get("speed_kp", 0.15)),
-                speed_ki=float(settings.get("speed_ki", 0.0)),
-                speed_kd=float(settings.get("speed_kd", 0.25)),
-                accel_kp=float(settings.get("accel_kp", 0.01)),
-                accel_ki=float(settings.get("accel_ki", 0.0)),
-                accel_kd=float(settings.get("accel_kd", 0.01)),
-            )
+    settings = cfg.get("ackermann_settings") or {}
+    hero.apply_ackermann_controller_settings(
+        carla.AckermannControllerSettings(
+            speed_kp=float(settings.get("speed_kp", 0.15)),
+            speed_ki=float(settings.get("speed_ki", 0.00)),
+            speed_kd=float(settings.get("speed_kd", 0.25)),
+            accel_kp=float(settings.get("accel_kp", 0.01)),
+            accel_ki=float(settings.get("accel_ki", 0.00)),
+            accel_kd=float(settings.get("accel_kd", 0.01)),
         )
+    )
     agent._ackermann_gear_initialized = True
 
 
@@ -1000,6 +1322,30 @@ def _plan_step1_speed(plan: np.ndarray, plan_dt: float) -> float:
         return 0.0
     return float(np.linalg.norm(plan[0, :2])) / float(plan_dt)
 
+
+
+def _ackermann_speed_target_derived(
+    agent,
+    plan_traj: np.ndarray,
+    dt: float,
+) -> float:
+    """Target speed (m/s) = the plan's implied speed a lookahead-horizon ahead.
+
+    Finite-differences consecutive (x, y) waypoints into per-segment speeds
+    (v_k = ||pos_{k+1} - pos_k|| / dt), then picks the segment ``horizon``
+    seconds ahead so the setpoint commits to the plan's accelerating profile
+    instead of tracking the timid first segment.
+    """
+    cfg = _control_cfg(agent)
+    xy = np.asarray(plan_traj[:, :2], dtype=np.float64)
+    if len(xy) < 2 or dt <= 0.0:
+        return 0.0
+
+    segment_speeds = np.linalg.norm(np.diff(xy, axis=0), axis=1) / dt  # (N-1,)
+    horizon = float(cfg.get("speed_horizon_sec", LQR_DISCRETIZATION_TIME))
+    idx = min(int(round(horizon / dt)), len(segment_speeds) - 1)
+    target_segment_speed = float(segment_speeds[idx])
+    return float(np.clip(target_segment_speed, 0.0, float(cfg.get("max_speed", 20.1))))
 
 def _ackermann_speed_target(
     agent,
@@ -1182,7 +1528,10 @@ def _apply_plan_control_ackermann(
         raise RuntimeError("hero vehicle not found for Ackermann control")
 
     _ensure_ackermann_gear(agent, hero)
-    target_speed = _ackermann_speed_target(agent, info, acc_cmd)
+    # old
+    # target_speed = _ackermann_speed_target(agent, info, acc_cmd)
+    # new
+    target_speed = _ackermann_speed_target_derived(agent, selected_plan, LQR_DISCRETIZATION_TIME)
     target_steer, steer_speed = _lqr_to_ackermann_steer(
         agent, hero, info, steering_rate_cmd,
     )
@@ -1922,6 +2271,7 @@ def setup_cameras_and_recording(agent):
     agent._recording_dir = agent._output_dir / dir_name
     agent._grid_video_buffer: List[np.ndarray] = []
     agent._topdown_video_buffer: List[np.ndarray] = []
+    agent._front_video_buffer: List[np.ndarray] = []
     agent._recording_finalized = False
     agent._predictions_dir = resolve_predictions_dir(agent)
     agent._topdown_camera_spec = None
@@ -2054,6 +2404,16 @@ def finalize_recording(agent) -> None:
             "Wrote topdown video: %s (%d frames)",
             topdown_path,
             len(topdown_buffer),
+        )
+
+    front_buffer = getattr(agent, "_front_video_buffer", [])
+    if getattr(agent, "_recording_save_front_video", False) and front_buffer:
+        front_path = agent._recording_dir / "front.mp4"
+        write_rgb_video(front_path, front_buffer, fps)
+        LOG.info(
+            "Wrote front video: %s (%d frames)",
+            front_path,
+            len(front_buffer),
         )
 
 # ------------------------------------------------------------------

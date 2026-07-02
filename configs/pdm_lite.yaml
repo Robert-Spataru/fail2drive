@@ -1,0 +1,18 @@
+# PDM-Lite (visu_agent / AutoPilot expert) with front-camera video recording
+pdm_lite:
+  live_window: true  # set false for headless runs (recording still works)
+
+carla:
+  output_dir: /data/robert/outputs/fail2drive/pdm_lite
+  auto_run_id: true
+  overwrite_scenario_output: true
+  scenarios_dir_name: scenarios
+  recording:
+    enabled: true
+    dir_name: recordings
+    save_frames: false
+    save_video: false
+    save_front_video: true
+    save_grid_video: false
+    save_topdown_video: false
+    fps: 20

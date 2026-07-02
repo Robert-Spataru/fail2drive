@@ -29,11 +29,11 @@ carla:
   camera_rig: 4cam
   predictions_dir: predictions
   control:
-  mode: ackermann
-  max_speed: 20.1
-  speed_horizon_sec: 0.5
-  steer_horizon_sec: 0.5
-  debug: true
+    mode: ackermann
+    max_speed: 20.1
+    speed_horizon_sec: 3
+    steer_horizon_sec: 0.5
+    debug: true
   topdown_camera:
     width: 800
     height: 800
@@ -45,7 +45,7 @@ carla:
     dir_name: recordings
     save_frames: false
     save_video: false
-    save_front_video: false
+    save_front_video: true
     save_grid_video: false
     save_topdown_video: true
     fps: 20
